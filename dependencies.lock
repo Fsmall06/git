@@ -1,49 +1,10 @@
 dependencies:
-  espressif/adc_mic:
-    component_hash: dd39c1142555f41ee06671355e91d6dc1fd9f1ef424f78f3dcfbafd8ac030df4
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: '*'
-    - name: espressif/esp_codec_dev
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=1.3.0,<1.5.5'
-    - name: idf
-      require: private
-      version: '>=5.0'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 0.2.3
-  espressif/cmake_utilities:
-    component_hash: 05165f30922b422b4b90c08845e6d449329b97370fbd06309803d8cb539d79e3
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=4.1'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 1.1.1
-  espressif/esp_codec_dev:
-    component_hash: 0d9e9bc288156eb55f79338d312e1ebf8c9dfbd5e7d13ef0f20ccb031b4e15cf
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=4.0'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 1.5.4
   idf:
     source:
       type: idf
     version: 5.5.4
 direct_dependencies:
-- espressif/adc_mic
 - idf
-manifest_hash: 0f683a23600a1d7da9dcbb3283d80cc1392bd308eaa96a52baa388ea724183e4
+manifest_hash: e44bf68eca6b7b264ddae08cd014cd3294c0473230381b6d6f88ed18ec879038
 target: esp32c5
 version: 2.0.0
