@@ -1,13 +1,19 @@
 set(src_dirs
             IIC
             BME690
+            LCD
             )
 set(include_dirs
            IIC
            BME690
+           LCD
             )
 set(requires
             esp_driver_i2c
+            esp_driver_spi
+            esp_driver_gpio
+            esp_lcd
+            heap
             driver
             )
 idf_component_register(SRC_DIRS ${src_dirs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})
