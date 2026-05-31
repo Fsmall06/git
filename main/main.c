@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "env.h"
 #include "lcd.h"
+#include "touch_cst816t.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -44,6 +45,25 @@ void app_main(void)
 
         lcd_draw_string(20, 40, "ESP32-C5", BLACK, WHITE);
         lcd_draw_string(20, 70, "SensAir Shuttle", BLACK, WHITE);
+    }
+
+    esp_err_t touch_ret = cst816t_init();
+    if (touch_ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "cst816t_init failed: %s", esp_err_to_name(touch_ret));
+    }
+    else
+    {
+        BaseType_t task_ret = xTaskCreate(cst816t_poll_task,
+                                          CST816T_POLL_TASK_NAME,
+                                          CST816T_POLL_TASK_STACK_SIZE,
+                                          NULL,
+                                          CST816T_POLL_TASK_PRIORITY,
+                                          NULL);
+        if (task_ret != pdPASS)
+        {
+            ESP_LOGE(TAG, "cst816t_poll_task create failed");
+        }
     }
 
     while (1)

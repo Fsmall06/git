@@ -13,6 +13,8 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_st7789.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "LCD";
 
@@ -113,6 +115,55 @@ static const lcd_font5x7_t s_lcd_font5x7[] = {
     {'?', {0x02, 0x01, 0x51, 0x09, 0x06}},
 };
 
+/* lcd_rgb_order_to_string：把 RGB/BGR 枚举转换为日志字符串。
+ *
+ * 功能：
+ *     lcd_init() 打印颜色配置时使用，让串口日志能直接看到当前是 RGB 还是 BGR。
+ *
+ * 调用方法：
+ *     ESP_LOGI(TAG, "order=%s", lcd_rgb_order_to_string(LCD_RGB_ELEMENT_ORDER));
+ *
+ * 说明：
+ *     该函数只服务 LCD 模块内部日志，不影响 ST7789 初始化流程。
+ */
+static const char *lcd_rgb_order_to_string(lcd_rgb_element_order_t order)
+{
+    switch (order)
+    {
+    case LCD_RGB_ELEMENT_ORDER_RGB:
+        return "LCD_RGB_ELEMENT_ORDER_RGB";
+    case LCD_RGB_ELEMENT_ORDER_BGR:
+        return "LCD_RGB_ELEMENT_ORDER_BGR";
+    default:
+        return "LCD_RGB_ELEMENT_ORDER_UNKNOWN";
+    }
+}
+
+/* lcd_rgb_endian_to_string：把 RGB565 数据字节序枚举转换为日志字符串。
+ *
+ * 功能：
+ *     lcd_init() 打印 LCD_RGB_DATA_ENDIAN 时使用，方便确认当前 ST7789 RAMCTRL 字节序配置。
+ *
+ * 调用方法：
+ *     ESP_LOGI(TAG, "endian=%s", lcd_rgb_endian_to_string(LCD_RGB_DATA_ENDIAN));
+ *
+ * 说明：
+ *     ESP-IDF 的 ST7789 驱动会根据该枚举配置 ST7789 的 RAMCTRL 寄存器，
+ *     但 SPI IO 发送颜色缓冲区时不会自动交换 uint16_t 内存里的高低字节。
+ */
+static const char *lcd_rgb_endian_to_string(lcd_rgb_data_endian_t endian)
+{
+    switch (endian)
+    {
+    case LCD_RGB_DATA_ENDIAN_BIG:
+        return "LCD_RGB_DATA_ENDIAN_BIG";
+    case LCD_RGB_DATA_ENDIAN_LITTLE:
+        return "LCD_RGB_DATA_ENDIAN_LITTLE";
+    default:
+        return "LCD_RGB_DATA_ENDIAN_UNKNOWN";
+    }
+}
+
 /* lcd_color_to_panel：把标准 RGB565 颜色转换成 LCD SPI 实际发送顺序。
  *
  * 参数：
@@ -122,7 +173,14 @@ static const lcd_font5x7_t s_lcd_font5x7[] = {
  *     写入 DMA 缓冲区的 16bit 数据。
  *
  * 说明：
- *     当 LCD_COLOR_SWAP_BYTES=1 时会交换高低字节，使 SPI 线上发送高字节在前。
+ *     1. ESP32-C5 是小端 CPU，uint16_t color=0xF800 写入内存后字节顺序是 00 F8。
+ *     2. ESP-IDF 5.5.4 的 esp_lcd ST7789 驱动中，LCD_RGB_DATA_ENDIAN_BIG 会配置
+ *        ST7789 的 RAMCTRL 寄存器，让屏幕按高字节在前解释 RGB565 数据。
+ *     3. esp_lcd 的 SPI IO 层发送颜色数据时使用调用者传入的 tx_buffer，不会再帮
+ *        uint16_t 缓冲区做一次高低字节交换，因此这里的 LCD_COLOR_SWAP_BYTES 不是
+ *        与 SPI IO 重复交换，而是把小端内存整理成屏幕期望的线上字节顺序。
+ *     4. 如果后续把 LCD_RGB_DATA_ENDIAN 改成 LCD_RGB_DATA_ENDIAN_LITTLE，通常也要
+ *        把 LCD_COLOR_SWAP_BYTES 改为 0，再通过 lcd_color_test() 实测确认。
  */
 static uint16_t lcd_color_to_panel(uint16_t color)
 {
@@ -270,6 +328,21 @@ esp_err_t lcd_init(void)
     {
         return ret;
     }
+
+    ESP_LOGI(TAG, "LCD 颜色测试方案: %s", LCD_COLOR_ACTIVE_TEST_SCHEME_NAME);
+    ESP_LOGI(TAG, "LCD_RGB_ELEMENT_ORDER=%s (%d)",
+             lcd_rgb_order_to_string(LCD_RGB_ELEMENT_ORDER),
+             (int)LCD_RGB_ELEMENT_ORDER);
+    ESP_LOGI(TAG, "LCD_RGB_DATA_ENDIAN=%s (%d)",
+             lcd_rgb_endian_to_string(LCD_RGB_DATA_ENDIAN),
+             (int)LCD_RGB_DATA_ENDIAN);
+    ESP_LOGI(TAG, "LCD_COLOR_SWAP_BYTES=%d，RGB565 红色 0x%04X 写入缓冲区后为 0x%04X",
+             LCD_COLOR_SWAP_BYTES,
+             LCD_COLOR_RED,
+             lcd_color_to_panel(LCD_COLOR_RED));
+    ESP_LOGI(TAG, "LCD_COLOR_INVERT_ENABLE=%d，%s LCD 反色命令",
+             LCD_COLOR_INVERT_ENABLE,
+             LCD_COLOR_INVERT_ENABLE ? "开启" : "关闭");
 
     spi_bus_config_t bus_config = {
         .sclk_io_num = LCD_PIN_NUM_SCLK,
@@ -672,5 +745,58 @@ esp_err_t lcd_draw_string(uint16_t x, uint16_t y, const char *str, uint16_t colo
         str++;
     }
 
+    return ESP_OK;
+}
+
+esp_err_t lcd_color_test(void)
+{
+    esp_err_t ret = lcd_check_ready();
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
+
+    /* 颜色测试表：
+     *     color：标准 RGB565 原始颜色值，便于直接和 ST7789/RGB565 手册核对；
+     *     name：串口日志使用的颜色名称，方便观察实物屏幕时记录现象。
+     *
+     * 调用方法：
+     *     ESP_ERROR_CHECK(lcd_init());
+     *     ESP_ERROR_CHECK(lcd_color_test());
+     */
+    const struct
+    {
+        uint16_t color;
+        const char *name;
+    } color_test_items[] = {
+        {0xF800, "RED   0xF800"},
+        {0x07E0, "GREEN 0x07E0"},
+        {0x001F, "BLUE  0x001F"},
+        {0xFFFF, "WHITE 0xFFFF"},
+        {0x0000, "BLACK 0x0000"},
+    };
+
+    ESP_LOGI(TAG, "开始 LCD 颜色测试，当前方案=%s，每个颜色停留 %d ms",
+             LCD_COLOR_ACTIVE_TEST_SCHEME_NAME,
+             LCD_COLOR_TEST_DELAY_MS);
+    ESP_LOGI(TAG, "观察顺序应为：红 -> 绿 -> 蓝 -> 白 -> 黑");
+
+    for (size_t i = 0; i < (sizeof(color_test_items) / sizeof(color_test_items[0])); i++)
+    {
+        ESP_LOGI(TAG, "LCD 颜色测试: %s，写入面板缓冲值=0x%04X",
+                 color_test_items[i].name,
+                 lcd_color_to_panel(color_test_items[i].color));
+
+        ret = lcd_clear(color_test_items[i].color);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "LCD 颜色测试失败: %s", esp_err_to_name(ret));
+            return ret;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(LCD_COLOR_TEST_DELAY_MS));
+    }
+
+    ESP_LOGI(TAG, "LCD 颜色测试完成");
     return ESP_OK;
 }

@@ -172,33 +172,84 @@
  */
 #define LCD_MAX_TRANSFER_SIZE                (LCD_H_RES * LCD_DRAW_BUFFER_LINES * sizeof(uint16_t))
 
-/* LCD_RGB_ELEMENT_ORDER：LCD RGB/BGR 颜色分量顺序。
+/* LCD_COLOR_TEST_SCHEME_*：LCD 颜色格式测试方案编号。
  * 功能：
- *     如果 lcd_clear(RED) 显示成蓝色，优先在 RGB 和 BGR 之间切换该宏。
+ *     用一个宏在三组颜色格式配置之间切换，避免调试时同时改多处参数。
+ * 调用方法：
+ *     1. 修改 LCD_COLOR_ACTIVE_TEST_SCHEME 为 A/B/C 其中一个；
+ *     2. 重新编译、烧录；
+ *     3. 调用 lcd_color_test(); 观察红、绿、蓝、白、黑是否正常。
+ *
+ * 方案A：
+ *     LCD_RGB_ELEMENT_ORDER_RGB
+ *     LCD_RGB_DATA_ENDIAN_BIG
+ *     LCD_COLOR_SWAP_BYTES=0
+ *
+ * 方案B：
+ *     LCD_RGB_ELEMENT_ORDER_RGB
+ *     LCD_RGB_DATA_ENDIAN_BIG
+ *     LCD_COLOR_SWAP_BYTES=1
+ *
+ * 方案C：
+ *     LCD_RGB_ELEMENT_ORDER_BGR
+ *     LCD_RGB_DATA_ENDIAN_BIG
+ *     LCD_COLOR_SWAP_BYTES=0
  */
+#define LCD_COLOR_TEST_SCHEME_A              1
+#define LCD_COLOR_TEST_SCHEME_B              2
+#define LCD_COLOR_TEST_SCHEME_C              3
+
+/* LCD_COLOR_ACTIVE_TEST_SCHEME：当前启用的 LCD 颜色测试方案。
+ * 功能：
+ *     统一选择 LCD_RGB_ELEMENT_ORDER、LCD_RGB_DATA_ENDIAN、LCD_COLOR_SWAP_BYTES。
+ * 当前推荐：
+ *     先使用方案B。ESP32-C5 是小端 CPU，ST7789 常用大端 RGB565，
+ *     因此 uint16_t 颜色写入 DMA 缓冲区前通常需要交换高低字节。
+ * 后续调试：
+ *     如果红蓝互换，先观察 LCD_COLOR_INVERT_ENABLE 是否正确，再切换到方案C 对比。
+ */
+#ifndef LCD_COLOR_ACTIVE_TEST_SCHEME
+#define LCD_COLOR_ACTIVE_TEST_SCHEME         LCD_COLOR_TEST_SCHEME_B
+#endif
+
+#if LCD_COLOR_ACTIVE_TEST_SCHEME == LCD_COLOR_TEST_SCHEME_A
+#define LCD_COLOR_ACTIVE_TEST_SCHEME_NAME    "方案A: RGB/BIG/SWAP=0"
 #define LCD_RGB_ELEMENT_ORDER                LCD_RGB_ELEMENT_ORDER_RGB
-
-/* LCD_RGB_DATA_ENDIAN：RGB565 像素数据在 LCD 侧的字节序。
- * 功能：
- *     ST7789 默认常用大端传输，也就是高字节先发。
- */
 #define LCD_RGB_DATA_ENDIAN                  LCD_RGB_DATA_ENDIAN_BIG
-
-/* LCD_COLOR_SWAP_BYTES：写入 SPI 前是否交换 RGB565 的高低字节。
- * 功能：
- *     ESP32-C5 为小端 CPU，uint16_t 颜色 0xF800 在内存中是 00 F8；
- *     大多数 SPI LCD 需要收到 F8 00 才能显示红色，因此默认开启字节交换。
- * 调试方法：
- *     如果 RED/GREEN/BLUE 颜色异常，可先切换 LCD_RGB_ELEMENT_ORDER；
- *     如果颜色仍异常，再尝试把该宏改为 0。
- */
+#define LCD_COLOR_SWAP_BYTES                 0
+#elif LCD_COLOR_ACTIVE_TEST_SCHEME == LCD_COLOR_TEST_SCHEME_B
+#define LCD_COLOR_ACTIVE_TEST_SCHEME_NAME    "方案B: RGB/BIG/SWAP=1"
+#define LCD_RGB_ELEMENT_ORDER                LCD_RGB_ELEMENT_ORDER_RGB
+#define LCD_RGB_DATA_ENDIAN                  LCD_RGB_DATA_ENDIAN_BIG
 #define LCD_COLOR_SWAP_BYTES                 1
+#elif LCD_COLOR_ACTIVE_TEST_SCHEME == LCD_COLOR_TEST_SCHEME_C
+#define LCD_COLOR_ACTIVE_TEST_SCHEME_NAME    "方案C: BGR/BIG/SWAP=0"
+#define LCD_RGB_ELEMENT_ORDER                LCD_RGB_ELEMENT_ORDER_BGR
+#define LCD_RGB_DATA_ENDIAN                  LCD_RGB_DATA_ENDIAN_BIG
+#define LCD_COLOR_SWAP_BYTES                 0
+#else
+#error "LCD_COLOR_ACTIVE_TEST_SCHEME 只能选择 LCD_COLOR_TEST_SCHEME_A/B/C"
+#endif
 
 /* LCD_COLOR_INVERT_ENABLE：是否开启 LCD 反色显示。
  * 功能：
- *     有些 ST7789 屏幕需要打开反色后颜色才正常。如果白色变黑色或颜色整体反相，可修改该宏。
+ *     控制 esp_lcd_panel_invert_color() 的参数，用于匹配 ST7789 屏幕玻璃的极性。
+ *     如果白色显示为黑色、绿色显示为紫色、蓝色显示为黄色，通常说明反色极性不匹配。
+ * 当前推荐：
+ *     本屏当前现象包含 WHITE -> BLACK，优先设置为 1 进行验证。
+ * 调用方法：
+ *     lcd_init();        // 初始化时会读取该宏并打印日志
+ *     lcd_color_test();  // 观察白色和黑色是否已经恢复正常
  */
-#define LCD_COLOR_INVERT_ENABLE              0
+#define LCD_COLOR_INVERT_ENABLE              1
+
+/* LCD_COLOR_TEST_DELAY_MS：lcd_color_test() 每个测试颜色停留时间。
+ * 功能：
+ *     控制红、绿、蓝、白、黑五个纯色画面之间的等待时间，单位 ms。
+ * 调用方法：
+ *     lcd_color_test();  // 每个颜色停留 LCD_COLOR_TEST_DELAY_MS 毫秒
+ */
+#define LCD_COLOR_TEST_DELAY_MS              3000
 
 /* LCD_MIRROR_X_ENABLE / LCD_MIRROR_Y_ENABLE：屏幕 X/Y 方向镜像。
  * 功能：
@@ -387,5 +438,23 @@ esp_err_t lcd_draw_char(uint16_t x, uint16_t y, char ch, uint16_t color, uint16_
  *     lcd_draw_string(20, 70, "SensAir Shuttle", LCD_COLOR_WHITE, LCD_COLOR_BLACK);
  */
 esp_err_t lcd_draw_string(uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg_color);
+
+/* lcd_color_test：LCD RGB565 颜色格式测试函数。
+ *
+ * 功能：
+ *     依次整屏显示 0xF800、0x07E0、0x001F、0xFFFF、0x0000，
+ *     分别对应标准 RGB565 的红、绿、蓝、白、黑，每个颜色停留 3 秒。
+ *
+ * 调用方法：
+ *     ESP_ERROR_CHECK(lcd_init());
+ *     ESP_ERROR_CHECK(lcd_color_test());
+ *
+ * 调试方法：
+ *     如果五个画面依次显示为红、绿、蓝、白、黑，说明当前颜色格式配置正确。
+ *     如果白色显示为黑色，优先切换 LCD_COLOR_INVERT_ENABLE。
+ *     如果红色和蓝色互换，优先切换 LCD_COLOR_ACTIVE_TEST_SCHEME 到方案C对比。
+ *     如果颜色发灰、发紫或红绿蓝都不对，优先在方案A和方案B之间对比字节交换。
+ */
+esp_err_t lcd_color_test(void);
 
 #endif
