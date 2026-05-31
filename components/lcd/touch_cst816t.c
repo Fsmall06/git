@@ -331,7 +331,7 @@ esp_err_t cst816t_init(void)
     }
 
     cst816t_print_version(chip_id, proj_id, fw_version);
-    ESP_LOGI(TAG, "CST816T 初始化完成，采用 50ms 轮询模式，不使用中断");
+    ESP_LOGI(TAG, "CST816T 初始化完成，等待上层任务轮询读取触摸坐标");
 
     return ESP_OK;
 }
@@ -377,10 +377,6 @@ bool cst816t_read_point(uint16_t *x, uint16_t *y, bool *pressed)
                     << CST816T_COORD_HIGH_SHIFT) |
                    (uint16_t)yl);
     *pressed = true;
-
-    printf("TOUCH:\npressed=1\nx=%u\ny=%u\n",
-           (unsigned int)(*x),
-           (unsigned int)(*y));
 
     return true;
 }

@@ -1,3 +1,3 @@
 idf_component_register(SRCS "main.c"
                     INCLUDE_DIRS "."
-                    REQUIRES Middlewares lcd)
+                    REQUIRES Middlewares lcd touch_paint)

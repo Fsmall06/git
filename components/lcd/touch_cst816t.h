@@ -182,9 +182,9 @@
  *     0：关闭原始寄存器打印，减少串口日志量。
  *
  * 当前要求：
- *     为了确认官方寄存器解析是否正确，默认开启。
+ *     触摸画板阶段默认关闭，坐标日志由 touch_paint_task() 按 500ms 限流打印。
  */
-#define CST816T_RAW_DEBUG_ENABLE                 1
+#define CST816T_RAW_DEBUG_ENABLE                 0
 
 /* CST816T_POLL_PERIOD_MS：触摸轮询周期，单位 ms。
  *
@@ -252,12 +252,9 @@ esp_err_t cst816t_init(void);
  * 功能：
  *     1. 按官方寄存器顺序读取 GestureID、FingerNum、XposH、XposL、YposH、YposL；
  *     2. FingerNum == 0 时输出 pressed=false，并把 x/y 清零；
- *     3. FingerNum > 0 时输出 pressed=true，解析 x/y，并打印：
- *            TOUCH:
- *            pressed=1
- *            x=%u
- *            y=%u
- *     4. 每次成功读取都会按 CST816T_RAW_DEBUG_ENABLE 配置打印原始寄存器。
+ *     3. FingerNum > 0 时输出 pressed=true，并解析 x/y；
+ *     4. 本函数不直接打印触摸坐标，避免高频读取时刷爆串口；
+ *     5. 每次成功读取都会按 CST816T_RAW_DEBUG_ENABLE 配置打印原始寄存器。
  *
  * 参数：
  *     x：输出参数，保存解析后的 X 坐标，不能为 NULL；
@@ -284,7 +281,8 @@ bool cst816t_read_point(uint16_t *x, uint16_t *y, bool *pressed);
  * 功能：
  *     1. 暂时采用轮询模式，不使用中断；
  *     2. 每隔 CST816T_POLL_PERIOD_MS 调用一次 cst816t_read_point()；
- *     3. 只通过串口打印触摸状态，不调用 LCD 绘图接口，因此不会影响 LCD 模块。
+ *     3. 本兼容任务只读取触摸状态，不调用 LCD 绘图接口；
+ *     4. Touch Paint Demo 不再创建本任务，坐标日志由 touch_paint_task() 限流输出。
  *
  * 调用方法：
  *     xTaskCreate(cst816t_poll_task,
