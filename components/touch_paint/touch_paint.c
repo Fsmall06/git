@@ -10,6 +10,12 @@
 
 static const char *TAG = TOUCH_PAINT_LOG_TAG;
 
+#define TOUCH_X_MIN 14
+#define TOUCH_X_MAX 226
+
+#define TOUCH_Y_MIN 35
+#define TOUCH_Y_MAX 271
+
 /* s_touch_paint_task_handle：触摸画板任务句柄。
  *
  * 说明：
@@ -102,21 +108,43 @@ static bool touch_paint_is_valid_point(uint16_t x, uint16_t y)
 
 static bool touch_paint_map_point(uint16_t raw_x, uint16_t raw_y, uint16_t *map_x, uint16_t *map_y)
 {
+    if ((raw_x >= 4090) || (raw_y >= 4090))
+    {
+        return false;
+    }
+
     if ((map_x == NULL) || (map_y == NULL))
     {
         return false;
     }
 
-    *map_x = raw_x;
-    *map_y = raw_y;
+    int32_t scaled_x = ((int32_t)raw_x - TOUCH_X_MIN) * (int32_t)(LCD_H_RES - 1U) /
+                       (TOUCH_X_MAX - TOUCH_X_MIN);
+    int32_t scaled_y = ((int32_t)raw_y - TOUCH_Y_MIN) * (int32_t)(LCD_V_RES - 1U) /
+                       (TOUCH_Y_MAX - TOUCH_Y_MIN);
 
-    if (!touch_paint_is_valid_point(raw_x, raw_y))
+    scaled_y = (int32_t)(LCD_V_RES - 1U) - scaled_y;
+
+    if (scaled_x < 0)
     {
-        return false;
+        scaled_x = 0;
+    }
+    else if (scaled_x >= (int32_t)LCD_H_RES)
+    {
+        scaled_x = (int32_t)LCD_H_RES - 1;
     }
 
-    *map_x = raw_x;
-    *map_y = (uint16_t)(LCD_V_RES - 1U - raw_y);
+    if (scaled_y < 0)
+    {
+        scaled_y = 0;
+    }
+    else if (scaled_y >= (int32_t)LCD_V_RES)
+    {
+        scaled_y = (int32_t)LCD_V_RES - 1;
+    }
+
+    *map_x = (uint16_t)scaled_x;
+    *map_y = (uint16_t)scaled_y;
 
     return true;
 }
@@ -300,47 +328,55 @@ void touch_paint_task(void *arg)
         bool read_ok = cst816t_read_point(&x, &y, &pressed);
         if (read_ok && pressed)
         {
+            uint16_t raw_x = x;
+            uint16_t raw_y = y;
             uint16_t map_x = 0;
             uint16_t map_y = 0;
-            bool point_valid = touch_paint_map_point(x, y, &map_x, &map_y);
+            bool print_touch_log = touch_paint_should_print_log(&last_touch_log_tick, TOUCH_PAINT_LOG_PERIOD_MS);
 
-            if (touch_paint_should_print_log(&last_touch_log_tick, TOUCH_PAINT_LOG_PERIOD_MS))
+            if (print_touch_log)
             {
                 ESP_LOGI(TAG,
-                         "RAW:\nx=%u\ny=%u\nMAP:\nx=%u\ny=%u",
-                         (unsigned int)x,
-                         (unsigned int)y,
+                         "RAW x=%u y=%u",
+                         (unsigned int)raw_x,
+                         (unsigned int)raw_y);
+            }
+
+            if (!touch_paint_map_point(raw_x, raw_y, &map_x, &map_y))
+            {
+                has_last_point = false;
+                vTaskDelay(touch_paint_ms_to_ticks(TOUCH_PAINT_PERIOD_MS));
+                continue;
+            }
+
+            if (print_touch_log)
+            {
+                ESP_LOGI(TAG,
+                         "MAP x=%u y=%u",
                          (unsigned int)map_x,
                          (unsigned int)map_y);
             }
 
-            if (point_valid)
+            esp_err_t ret = ESP_OK;
+
+            if (has_last_point && touch_paint_is_valid_point(last_x, last_y))
             {
-                esp_err_t ret = ESP_OK;
-
-                if (has_last_point && touch_paint_is_valid_point(last_x, last_y))
-                {
-                    ret = touch_paint_draw_line(last_x, last_y, map_x, map_y);
-                }
-                else
-                {
-                    ret = touch_paint_draw_point(map_x, map_y);
-                }
-
-                if ((ret != ESP_OK) &&
-                    touch_paint_should_print_log(&last_error_log_tick, TOUCH_PAINT_LOG_PERIOD_MS))
-                {
-                    ESP_LOGE(TAG, "Touch paint draw failed: %s", esp_err_to_name(ret));
-                }
-
-                last_x = map_x;
-                last_y = map_y;
-                has_last_point = true;
+                ret = touch_paint_draw_line(last_x, last_y, map_x, map_y);
             }
             else
             {
-                has_last_point = false;
+                ret = touch_paint_draw_point(map_x, map_y);
             }
+
+            if ((ret != ESP_OK) &&
+                touch_paint_should_print_log(&last_error_log_tick, TOUCH_PAINT_LOG_PERIOD_MS))
+            {
+                ESP_LOGE(TAG, "Touch paint draw failed: %s", esp_err_to_name(ret));
+            }
+
+            last_x = map_x;
+            last_y = map_y;
+            has_last_point = true;
         }
         else if (read_ok)
         {

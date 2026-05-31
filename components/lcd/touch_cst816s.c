@@ -148,12 +148,21 @@ esp_err_t touch_read(uint16_t *x, uint16_t *y, bool *pressed)
     const uint8_t yh = data[3];
     const uint8_t yl = data[4];
 
-    *x = (uint16_t)((((uint16_t)xh & TOUCH_CST816S_COORD_HIGH_MASK)
-                    << TOUCH_CST816S_COORD_HIGH_SHIFT) |
-                   (uint16_t)xl);
-    *y = (uint16_t)((((uint16_t)yh & TOUCH_CST816S_COORD_HIGH_MASK)
-                    << TOUCH_CST816S_COORD_HIGH_SHIFT) |
-                   (uint16_t)yl);
+    const uint16_t raw_x = (uint16_t)((((uint16_t)xh & TOUCH_CST816S_COORD_HIGH_MASK)
+                                       << TOUCH_CST816S_COORD_HIGH_SHIFT) |
+                                      (uint16_t)xl);
+    const uint16_t raw_y = (uint16_t)((((uint16_t)yh & TOUCH_CST816S_COORD_HIGH_MASK)
+                                       << TOUCH_CST816S_COORD_HIGH_SHIFT) |
+                                      (uint16_t)yl);
+
+    if ((raw_x >= 4090U) || (raw_y >= 4090U))
+    {
+        *pressed = false;
+        return ESP_OK;
+    }
+
+    *x = raw_x;
+    *y = raw_y;
     *pressed = true;
 
     return ESP_OK;

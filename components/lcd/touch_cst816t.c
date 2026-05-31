@@ -370,12 +370,21 @@ bool cst816t_read_point(uint16_t *x, uint16_t *y, bool *pressed)
         return true;
     }
 
-    *x = (uint16_t)((((uint16_t)xh & CST816T_COORD_HIGH_MASK)
-                    << CST816T_COORD_HIGH_SHIFT) |
-                   (uint16_t)xl);
-    *y = (uint16_t)((((uint16_t)yh & CST816T_COORD_HIGH_MASK)
-                    << CST816T_COORD_HIGH_SHIFT) |
-                   (uint16_t)yl);
+    const uint16_t raw_x = (uint16_t)((((uint16_t)xh & CST816T_COORD_HIGH_MASK)
+                                       << CST816T_COORD_HIGH_SHIFT) |
+                                      (uint16_t)xl);
+    const uint16_t raw_y = (uint16_t)((((uint16_t)yh & CST816T_COORD_HIGH_MASK)
+                                       << CST816T_COORD_HIGH_SHIFT) |
+                                      (uint16_t)yl);
+
+    if ((raw_x >= 4090U) || (raw_y >= 4090U))
+    {
+        *pressed = false;
+        return true;
+    }
+
+    *x = raw_x;
+    *y = raw_y;
     *pressed = true;
 
     return true;
