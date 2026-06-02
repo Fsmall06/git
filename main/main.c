@@ -5,7 +5,7 @@
 #include "env.h"
 #include "lcd.h"
 #include "touch_cst816t.h"
-#include "touch_paint.h"
+#include "ui_main.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -35,25 +35,21 @@ void app_main(void)
 
     if ((lcd_ret == ESP_OK) && (touch_ret == ESP_OK))
     {
-        esp_err_t paint_ret = touch_paint_start();
-        if (paint_ret != ESP_OK)
+        esp_err_t ui_ret = ui_main_start();
+        if (ui_ret != ESP_OK)
         {
-            ESP_LOGE(TAG, "touch_paint_start failed: %s", esp_err_to_name(paint_ret));
-        }
-        else
-        {
-            ESP_LOGI(TAG, "Touch Paint Demo started");
+            ESP_LOGE(TAG, "ui_main_start failed: %s", esp_err_to_name(ui_ret));
         }
     }
     else
     {
-        ESP_LOGE(TAG, "Touch Paint Demo skipped because LCD or CST816T init failed");
+        ESP_LOGE(TAG, "Touch UI skipped because LCD or CST816T init failed");
     }
 
-    esp_err_t ret = env_init();
-    if (ret != ESP_OK)
+    esp_err_t env_ret = env_init();
+    if (env_ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "env_init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "env_init failed: %s", esp_err_to_name(env_ret));
     }
     else
     {
