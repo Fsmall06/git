@@ -23,7 +23,7 @@
  * 调用方法：
  *     ui_main_start();    // 内部会使用 UI_MAIN_TASK_NAME 创建 UI 任务
  */
-#define UI_MAIN_TASK_NAME                    "ui_button_task"
+#define UI_MAIN_TASK_NAME                    "ui_task"
 
 /* UI_MAIN_TASK_STACK_SIZE：UI 触摸任务栈大小，单位 Byte。
  *
@@ -38,7 +38,7 @@
 /* UI_MAIN_TASK_PRIORITY：UI 触摸任务优先级。
  *
  * 功能：
- *     控制 UI 任务在 FreeRTOS 中的调度优先级。当前保持原按钮测试 Demo 的优先级。
+ *     控制 UI 任务在 FreeRTOS 中的调度优先级。当前用于 HOME/Sensor 页面触摸分发和刷新调度。
  */
 #define UI_MAIN_TASK_PRIORITY                5U
 
@@ -73,30 +73,6 @@
  */
 #define UI_MAIN_TOUCH_Y_MIN                  35
 #define UI_MAIN_TOUCH_Y_MAX                  271
-
-/* UI_MAIN_BUTTON_WIDTH / UI_MAIN_BUTTON_HEIGHT：按钮测试按键尺寸，单位像素。
- *
- * 功能：
- *     控制 HOME 页面中原有 BUTTON 测试按键的宽度和高度。
- */
-#define UI_MAIN_BUTTON_WIDTH                 132U
-#define UI_MAIN_BUTTON_HEIGHT                58U
-
-/* UI_MAIN_BUTTON_X / UI_MAIN_BUTTON_Y：按钮测试按键左上角坐标。
- *
- * 功能：
- *     控制 HOME 页面中原有 BUTTON 测试按键的位置。默认保持居中偏下的原始布局。
- */
-#define UI_MAIN_BUTTON_X                     ((uint16_t)((LCD_H_RES - UI_MAIN_BUTTON_WIDTH) / 2U))
-#define UI_MAIN_BUTTON_Y                     ((uint16_t)(((LCD_V_RES - UI_MAIN_BUTTON_HEIGHT) / 2U) + 18U))
-
-/* UI_MAIN_BUTTON_TEXT_X_OFFSET / UI_MAIN_BUTTON_TEXT_Y_OFFSET：BUTTON 文本相对按键左上角的偏移。
- *
- * 功能：
- *     控制原有 BUTTON 文字在测试按键内部的位置。
- */
-#define UI_MAIN_BUTTON_TEXT_X_OFFSET         30U
-#define UI_MAIN_BUTTON_TEXT_Y_OFFSET         22U
 
 /* UI_MAIN_HOME_TITLE_X / UI_MAIN_HOME_TITLE_Y：HOME 页面标题坐标。
  *
@@ -315,14 +291,6 @@
  */
 #define UI_MAIN_SCREEN_COLOR                 LCD_COLOR_BLACK
 
-/* UI_MAIN_BUTTON_BLUE / UI_MAIN_BUTTON_RED：原有 BUTTON 测试按键颜色。
- *
- * 功能：
- *     点击 BUTTON 后在蓝色和红色之间切换，用于保留现有按钮变色测试功能。
- */
-#define UI_MAIN_BUTTON_BLUE                  LCD_COLOR_BLUE
-#define UI_MAIN_BUTTON_RED                   LCD_COLOR_RED
-
 /* UI_MAIN_SENSOR_BTN_COLOR：Sensor 入口按键背景色。
  *
  * 功能：
@@ -344,19 +312,12 @@
  */
 #define UI_MAIN_TEXT_COLOR                   LCD_COLOR_WHITE
 
-/* UI_MAIN_BUTTON_TEXT_COLOR：按键文字颜色。
+/* UI_MAIN_BUTTON_TEXT_COLOR：当前页面按键文字颜色。
  *
  * 功能：
- *     BUTTON、Sensor、Back 三类按键文字使用该颜色。
+ *     HOME 页面的 Sensor 入口按键和 Sensor 页面的 Back 返回按键使用该颜色。
  */
 #define UI_MAIN_BUTTON_TEXT_COLOR            LCD_COLOR_WHITE
-
-/* UI_MAIN_BUTTON_BORDER_COLOR：按键边框或强调色。
- *
- * 功能：
- *     当前 LCD 绘图接口暂未单独绘制边框，本宏预留给后续调试边框或按键强调效果使用。
- */
-#define UI_MAIN_BUTTON_BORDER_COLOR          LCD_COLOR_WHITE
 
 /* UI_MAIN_SENSOR_LINE_BUF_SIZE：Sensor 页面单行数据格式化缓存长度，单位 Byte。
  *
@@ -428,19 +389,11 @@
  */
 #define UI_MAIN_SMALL_FONT_FALLBACK_CHAR     '?'
 
-/* UI_MAIN_BUTTON_TEXT：原有按钮测试按键文字。
- *
- * 功能：
- *     控制 HOME 页面中央变色测试按键的显示文字，当前保持原始 "BUTTON"。
- */
-#define UI_MAIN_BUTTON_TEXT                  "BUTTON"
-
 /* ui_main_start：启动 HOME/Sensor 页面切换任务。
  *
  * 功能：
  *     1. 绘制 HOME 页面标题和居中 Sensor 入口按键；
- *     2. 创建 UI 触摸任务，处理 HOME 的 Sensor 入口和 Sensor 页面的 Back 返回；
- *     3. 保留原 BUTTON 测试相关宏定义，方便后续临时恢复调试，但 HOME 页面默认不再调用。
+ *     2. 创建 UI 触摸任务，处理 HOME 的 Sensor 入口和 Sensor 页面的 Back 返回。
  *
  * 调用方法：
  *     ESP_ERROR_CHECK(lcd_init());

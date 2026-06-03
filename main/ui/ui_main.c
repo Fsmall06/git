@@ -16,7 +16,7 @@ static const char *TAG = "UI_MAIN";
 /* ui_page_t：UI 当前页面状态枚举。
  *
  * 功能：
- *     UI_PAGE_HOME 表示原有按钮测试主界面；
+ *     UI_PAGE_HOME 表示带有 Sensor 入口按键的 HOME 主界面；
  *     UI_PAGE_SENSOR 表示当前显示真实环境数据的 Sensor 页面。
  *
  * 调用方法：
@@ -30,7 +30,6 @@ typedef enum
 } ui_page_t;
 
 static TaskHandle_t s_ui_task_handle = NULL;
-static bool s_button_red = false;
 static ui_page_t s_current_page = UI_PAGE_HOME;
 
 /* ui_main_ms_to_ticks：把毫秒时间转换为 FreeRTOS tick。
@@ -139,8 +138,8 @@ static bool ui_main_map_touch_point(uint16_t raw_x, uint16_t raw_y, uint16_t *ma
  *     }
  *
  * 实现说明：
- *     使用本函数统一处理 HOME 页面中 BUTTON 保留按键和 Sensor 入口按键的矩形命中判断；
- *     Sensor 页面 Back 命中判断已经迁移到 ui_sensor_page_is_back_hit()，避免 ui_main.c 继续耦合
+ *     使用本函数统一处理 HOME 页面 Sensor 入口按键的矩形命中判断；
+ *     Sensor 页面 Back 命中判断由 ui_sensor_page_is_back_hit() 完成，避免 ui_main.c 继续耦合
  *     Sensor 页面内部按钮实现。
  */
 static bool ui_main_point_in_rect(uint16_t x,
@@ -161,32 +160,6 @@ static bool ui_main_point_in_rect(uint16_t x,
            (point_x < right) &&
            (point_y >= top) &&
            (point_y < bottom);
-}
-
-/* ui_main_point_in_button：判断触摸点是否落在原有 BUTTON 测试按键内。
- *
- * 参数：
- *     x：已经通过 ui_main_map_touch_point() 映射后的 LCD X 坐标。
- *     y：已经通过 ui_main_map_touch_point() 映射后的 LCD Y 坐标。
- *
- * 返回：
- *     true：触摸点位于 BUTTON 测试按键区域内；
- *     false：触摸点不在 BUTTON 测试按键区域内。
- *
- * 调用方法：
- *     if (ui_main_point_in_button(x, y)) {
- *         s_button_red = !s_button_red;
- *         ui_main_draw_button();
- *     }
- */
-static bool __attribute__((unused)) ui_main_point_in_button(uint16_t x, uint16_t y)
-{
-    return ui_main_point_in_rect(x,
-                                 y,
-                                 UI_MAIN_BUTTON_X,
-                                 UI_MAIN_BUTTON_Y,
-                                 UI_MAIN_BUTTON_WIDTH,
-                                 UI_MAIN_BUTTON_HEIGHT);
 }
 
 /* ui_main_point_in_sensor_button：判断触摸点是否落在 HOME 页面的 Sensor 入口按键内。
@@ -212,43 +185,6 @@ static bool ui_main_point_in_sensor_button(uint16_t x, uint16_t y)
                                  UI_MAIN_SENSOR_BTN_Y,
                                  UI_MAIN_SENSOR_BTN_W,
                                  UI_MAIN_SENSOR_BTN_H);
-}
-
-/* ui_main_draw_button：保留的原 BUTTON 变色测试按键绘制函数。
- *
- * 功能：
- *     根据 s_button_red 当前状态，把 HOME 页面中央测试按键绘制为红色或蓝色，
- *     并在按键内部绘制 "BUTTON" 文字。
- *     当前 HOME 页面已经改为单 Sensor 入口，因此本函数只作为原按钮测试代码保留，
- *     HOME 页面不会再主动调用它。
- *
- * 调用方法：
- *     // 如后续需要临时恢复按钮测试，可在 HOME 绘制或触摸逻辑中重新调用：
- *     // ui_main_draw_button();
- *
- * 返回：
- *     ESP_OK：绘制成功；
- *     其它值：LCD 绘图接口返回的错误码。
- */
-static esp_err_t __attribute__((unused)) ui_main_draw_button(void)
-{
-    const uint16_t color = s_button_red ? UI_MAIN_BUTTON_RED : UI_MAIN_BUTTON_BLUE;
-
-    esp_err_t ret = lcd_fill_rect(UI_MAIN_BUTTON_X,
-                                  UI_MAIN_BUTTON_Y,
-                                  UI_MAIN_BUTTON_WIDTH,
-                                  UI_MAIN_BUTTON_HEIGHT,
-                                  color);
-    if (ret != ESP_OK)
-    {
-        return ret;
-    }
-
-    return lcd_draw_string((uint16_t)(UI_MAIN_BUTTON_X + UI_MAIN_BUTTON_TEXT_X_OFFSET),
-                           (uint16_t)(UI_MAIN_BUTTON_Y + UI_MAIN_BUTTON_TEXT_Y_OFFSET),
-                           UI_MAIN_BUTTON_TEXT,
-                           UI_MAIN_BUTTON_TEXT_COLOR,
-                           color);
 }
 
 /* ui_main_draw_sensor_button：绘制 HOME 页面中的 Sensor 入口按键。
@@ -289,8 +225,7 @@ static esp_err_t ui_main_draw_sensor_button(void)
  * 功能：
  *     1. 清屏为 UI_MAIN_SCREEN_COLOR；
  *     2. 绘制 HOME 页面标题 UI_MAIN_HOME_TITLE_TEXT；
- *     3. 绘制屏幕中间的大 Sensor 入口按键；
- *     4. 不再绘制原 BUTTON 变色测试按键，也不再绘制右下角小 Sensor 按键。
+ *     3. 绘制屏幕中间的大 Sensor 入口按键。
  *
  * 调用方法：
  *     ui_main_start();                    // 启动 UI 时绘制 HOME 页面
@@ -318,7 +253,7 @@ static esp_err_t ui_main_draw_screen(void)
         return ret;
     }
 
-    /* 当前 HOME 页面只保留居中的 Sensor 入口，不再绘制原 BUTTON 变色测试按键。 */
+    /* 当前 HOME 页面只保留居中的 Sensor 入口。 */
     return ui_main_draw_sensor_button();
 }
 
@@ -376,7 +311,7 @@ static esp_err_t ui_main_switch_page(ui_page_t page)
  * 功能：
  *     1. 只判断 HOME 页面中间的大 Sensor 按键；
  *     2. 点击 Sensor 按键时调用 ui_main_switch_page(UI_PAGE_SENSOR) 进入 Sensor 页面；
- *     3. 其它区域触摸不处理，也不再触发原 BUTTON 变色测试逻辑。
+ *     3. 其它区域触摸不处理。
  *
  * 调用方法：
  *     if (s_current_page == UI_PAGE_HOME) {
@@ -471,8 +406,7 @@ static void ui_main_dispatch_touch(uint16_t x, uint16_t y)
  *     2. 只在新的按下沿处理一次触摸，避免长按时反复切换页面；
  *     3. 根据 s_current_page 分发 HOME/SENSOR 页面事件；
  *     4. 当当前页面是 UI_PAGE_SENSOR 时，周期调用 ui_sensor_page_update(false)，
- *        按 UI_MAIN_SENSOR_REFRESH_MS 间隔局部刷新环境数据文本；
- *     5. HOME 页面不再处理原 BUTTON 变色测试触摸逻辑。
+ *        按 UI_MAIN_SENSOR_REFRESH_MS 间隔局部刷新环境数据文本。
  *
  * 调用方法：
  *     ui_main_start();    // 内部通过 xTaskCreate() 创建本任务，不建议外部直接调用
@@ -543,11 +477,10 @@ esp_err_t ui_main_start(void)
 {
     if (s_ui_task_handle != NULL)
     {
-        ESP_LOGI(TAG, "UI button task already running");
+        ESP_LOGI(TAG, "UI task already running");
         return ESP_OK;
     }
 
-    s_button_red = false;
     s_current_page = UI_PAGE_HOME;
 
     esp_err_t ret = ui_main_switch_page(UI_PAGE_HOME);
@@ -566,10 +499,10 @@ esp_err_t ui_main_start(void)
     if (task_ret != pdPASS)
     {
         s_ui_task_handle = NULL;
-        ESP_LOGE(TAG, "UI button task create failed");
+        ESP_LOGE(TAG, "UI task create failed");
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "UI button demo started");
+    ESP_LOGI(TAG, "UI started");
     return ESP_OK;
 }
