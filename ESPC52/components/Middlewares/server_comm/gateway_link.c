@@ -248,6 +248,7 @@ void gateway_link_notify_wifi_down(void)
     s_link.wifi_got_ip_tick = 0;
     s_link.wifi_down_tick = xTaskGetTickCount();
     portEXIT_CRITICAL(&s_link_lock);
+    gateway_link_set_state(LINK_DOWN, "wifi_down");
     gateway_link_request_reconnect();
 }
 
@@ -258,6 +259,7 @@ void gateway_link_notify_wifi_got_ip(void)
     s_link.wifi_got_ip_tick = xTaskGetTickCount();
     s_link.wifi_down_tick = 0;
     portEXIT_CRITICAL(&s_link_lock);
+    gateway_link_set_state(LINK_WIFI_CONNECTED, "wifi_got_ip");
     gateway_link_request_reconnect();
 }
 

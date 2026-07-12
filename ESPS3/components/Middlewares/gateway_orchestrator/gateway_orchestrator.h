@@ -19,8 +19,8 @@ extern "C" {
  * 调用位置：main/gateway_startup_task()。
  * 调用时机：app_main 创建启动任务后立即调用。
  * 输入参数：无。
- * 返回值：无；启动失败的关键 ESP_ERROR_CHECK 会进入 ESP-IDF 错误处理。
- * 失败处理：可降级的 Server 可用性由 offline_policy 记录，HTTP handler 继续返回本地错误码。
+ * 返回值：无；关键初始化失败会进入 ESP-IDF 错误处理。
+ * 失败处理：network_worker 管理本地 HTTP ingress 的启动和重试，S3 主流程继续运行。
  */
 void gateway_orchestrator_start(void);
 

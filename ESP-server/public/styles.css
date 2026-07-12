@@ -40,8 +40,6 @@ body[data-theme="dark"] {
     --chart-temperature: #93c5fd;
     --chart-humidity: #34d399;
     --chart-air: #d8b4fe;
-    --csi-score: #93c5fd;
-    --csi-energy: #34d399;
     color-scheme: dark;
 }
 
@@ -84,8 +82,6 @@ body[data-theme="light"] {
     --chart-temperature: #3b73f6;
     --chart-humidity: #10b981;
     --chart-air: #8b5cf6;
-    --csi-score: #2f6df6;
-    --csi-energy: #10b981;
     color-scheme: light;
 }
 
@@ -94,7 +90,7 @@ body[data-theme="light"] {
 }
 
 html {
-    scroll-behavior: smooth;
+    scroll-behavior: auto;
 }
 
 body {
@@ -106,7 +102,7 @@ body {
     font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif;
     background: var(--page-bg);
     letter-spacing: 0;
-    transition: color 180ms ease, background 180ms ease;
+    transition: color 0.15s ease, background-color 0.15s ease;
 }
 
 button,
@@ -190,7 +186,7 @@ svg {
     border: 1px solid transparent;
     border-radius: var(--radius);
     font-weight: 700;
-    transition: color 160ms ease, background 160ms ease, border-color 160ms ease, transform 160ms ease;
+    transition: color 0.15s ease, background-color 0.15s ease;
 }
 
 .nav-item:hover,
@@ -199,7 +195,6 @@ svg {
     border-color: #d6e4ff;
     background: rgba(255, 255, 255, 0.86);
     box-shadow: 0 12px 24px rgba(30, 91, 180, 0.08);
-    transform: translateX(2px);
 }
 
 .nav-icon {
@@ -400,7 +395,6 @@ svg {
     height: 9px;
     border-radius: 999px;
     background: currentColor;
-    box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 14%, transparent);
 }
 
 .live-normal,
@@ -429,7 +423,6 @@ svg {
 
 .status-dot.online {
     background: #10b981;
-    box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.13);
 }
 
 .icon-button,
@@ -655,37 +648,6 @@ svg {
     color: #ef3340;
 }
 
-.card-update-meta {
-    position: relative;
-    z-index: 1;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px;
-    margin-top: 10px;
-}
-
-.metric-value span,
-.s3-sensor-metric strong,
-.s3-summary-tile strong,
-.s3-status-tile strong {
-    transition: color 180ms ease, background-color 180ms ease, box-shadow 180ms ease;
-}
-
-.value-increase {
-    color: var(--green) !important;
-    border-radius: 6px;
-    background: color-mix(in srgb, var(--green) 14%, transparent);
-    box-shadow: 0 0 0 5px color-mix(in srgb, var(--green) 10%, transparent);
-}
-
-.value-decrease {
-    color: var(--blue) !important;
-    border-radius: 6px;
-    background: color-mix(in srgb, var(--blue) 14%, transparent);
-    box-shadow: 0 0 0 5px color-mix(in srgb, var(--blue) 10%, transparent);
-}
-
 .sparkline {
     position: relative;
     z-index: 1;
@@ -744,7 +706,7 @@ svg {
 
 .s3-health-bar {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 12px;
 }
 
@@ -793,43 +755,6 @@ svg {
     white-space: nowrap;
 }
 
-.update-time {
-    display: inline-flex;
-    align-items: center;
-    min-width: 0;
-    color: var(--muted);
-    font-size: 12px;
-    font-weight: 750;
-    line-height: 1.35;
-}
-
-.trend-arrow {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 24px;
-    padding: 0 8px;
-    border-radius: 999px;
-    font-size: 12px;
-    font-weight: 850;
-    white-space: nowrap;
-}
-
-.trend-up {
-    color: var(--green);
-    background: color-mix(in srgb, var(--green) 14%, transparent);
-}
-
-.trend-down {
-    color: var(--blue);
-    background: color-mix(in srgb, var(--blue) 14%, transparent);
-}
-
-.trend-flat {
-    color: var(--muted);
-    background: var(--surface-soft);
-}
-
 .s3-overview-grid,
 .s3-activity-grid {
     display: grid;
@@ -856,7 +781,8 @@ svg {
 
 .s3-status-grid {
     grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 12px;
+    width: 100%;
+    gap: 18px;
 }
 
 .s3-status-tile,
@@ -1009,10 +935,27 @@ svg {
     gap: 18px;
 }
 
-.s3-sensor-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+.s3-device-card {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     align-items: stretch;
-    gap: 10px;
+    width: 100%;
+    gap: 16px;
+}
+
+.s3-device-card > .panel-header {
+    grid-column: 1 / -1;
+    margin-bottom: 0;
+}
+
+.s3-device-card > .s3-sensor-grid {
+    display: contents;
+}
+
+.s3-sensor-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: stretch;
+    gap: 16px;
 }
 
 .s3-sensor-metric {
@@ -1021,6 +964,11 @@ svg {
     gap: 8px;
     min-height: 76px;
     padding: 13px;
+}
+
+.s3-device-card .s3-sensor-metric {
+    height: 100%;
+    text-align: left;
 }
 
 .s3-sensor-metric strong {
@@ -1071,7 +1019,7 @@ svg {
     color: var(--muted);
     text-align: center;
     background: var(--surface-soft);
-    transition: border-color 160ms ease, background 160ms ease, color 160ms ease, transform 160ms ease;
+    transition: color 0.15s ease, background-color 0.15s ease;
 }
 
 .s3-appliance.is-on {
@@ -1104,10 +1052,6 @@ svg {
 .s3-appliance small {
     max-width: 100%;
     overflow-wrap: anywhere;
-}
-
-.s3-events-panel {
-    min-width: 0;
 }
 
 .event-timeline {
@@ -1172,7 +1116,7 @@ svg {
 
 .middle-grid {
     display: grid;
-    grid-template-columns: minmax(0, 1.75fr) minmax(340px, 0.95fr);
+    grid-template-columns: minmax(0, 1.45fr) repeat(2, minmax(300px, 0.8fr));
     gap: 18px;
 }
 
@@ -1181,12 +1125,6 @@ svg {
     grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(260px, 0.8fr);
     align-items: stretch;
     gap: 18px;
-    padding-top: 18px;
-}
-
-.csi-grid {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
     padding-top: 18px;
 }
 
@@ -1201,129 +1139,6 @@ svg {
     flex-direction: column;
     height: 100%;
     min-height: 0;
-}
-
-.csi-panel {
-    display: grid;
-    gap: 16px;
-}
-
-.csi-kpi-grid {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 12px;
-}
-
-.csi-kpi,
-.csi-trend {
-    min-width: 0;
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    background: var(--surface-bg);
-}
-
-.csi-kpi {
-    display: grid;
-    gap: 8px;
-    min-height: 92px;
-    padding: 14px;
-}
-
-.csi-kpi span,
-.csi-trend-label,
-.csi-timeline-item small {
-    color: var(--muted);
-}
-
-.csi-kpi strong {
-    color: var(--ink);
-    font-size: 24px;
-    line-height: 1.1;
-    font-weight: 850;
-    overflow-wrap: anywhere;
-}
-
-.csi-trend-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px;
-}
-
-.csi-trend {
-    display: grid;
-    gap: 8px;
-    min-height: 126px;
-    padding: 12px;
-}
-
-.csi-trend-label {
-    font-size: 13px;
-    font-weight: 800;
-}
-
-.csi-sparkline {
-    display: grid;
-    place-items: stretch;
-    width: 100%;
-    height: 72px;
-}
-
-.csi-sparkline svg {
-    width: 100%;
-    height: 72px;
-}
-
-.csi-timeline {
-    display: grid;
-    grid-template-columns: repeat(18, minmax(0, 1fr));
-    gap: 6px;
-    min-width: 0;
-}
-
-.csi-timeline-item {
-    display: grid;
-    align-content: center;
-    gap: 4px;
-    min-width: 0;
-    min-height: 54px;
-    padding: 7px 6px;
-    border: 1px solid currentColor;
-    border-radius: 8px;
-    background: var(--surface-bg);
-    font-size: 11px;
-    font-weight: 850;
-    text-align: center;
-}
-
-.csi-timeline-item span,
-.csi-timeline-item small {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.csi-timeline-item.normal {
-    color: var(--green);
-}
-
-.csi-timeline-item.warning {
-    color: var(--orange);
-}
-
-.csi-timeline-item.danger {
-    color: var(--red);
-}
-
-.csi-empty {
-    display: grid;
-    place-items: center;
-    min-height: 54px;
-    color: var(--muted);
-    border: 1px dashed var(--line);
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 750;
 }
 
 .logs-panel .panel-header,
@@ -1404,7 +1219,6 @@ svg {
 .range-button svg {
     width: 15px;
     height: 15px;
-    transition: transform 160ms ease;
 }
 
 .range-selector {
@@ -1541,6 +1355,99 @@ svg {
     background:
         linear-gradient(180deg, rgba(255, 246, 246, 0.88), rgba(255, 255, 255, 0.9)),
         var(--panel);
+}
+
+.activity-panel {
+    display: grid;
+    gap: 14px;
+}
+
+.activity-current {
+    display: grid;
+    gap: 8px;
+    min-height: 88px;
+    padding: 16px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface-bg);
+}
+
+.activity-current span,
+.activity-detail-grid span {
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 750;
+}
+
+.activity-current strong {
+    color: var(--ink);
+    font-size: 28px;
+    line-height: 1.1;
+}
+
+.activity-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.activity-detail-grid div {
+    display: grid;
+    gap: 6px;
+    min-width: 0;
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface-soft);
+}
+
+.activity-detail-grid strong {
+    color: var(--ink);
+    font-size: 18px;
+    line-height: 1.2;
+}
+
+.activity-trend {
+    display: grid;
+    gap: 10px;
+}
+
+.activity-trend h3 {
+    margin: 0;
+    color: var(--ink);
+    font-size: 15px;
+    line-height: 1.2;
+}
+
+.activity-chart {
+    height: 130px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface-bg);
+    overflow: hidden;
+}
+
+.activity-chart svg {
+    width: 100%;
+    height: 100%;
+}
+
+.activity-axis,
+.activity-guide {
+    stroke: color-mix(in srgb, var(--muted) 26%, transparent);
+    stroke-width: 1;
+}
+
+.activity-guide {
+    stroke-dasharray: 4 5;
+}
+
+.activity-line {
+    fill: none;
+    stroke: var(--green);
+    stroke-width: 4;
+    stroke-linecap: round;
+    stroke-linejoin: round;
 }
 
 .current-state {
@@ -1898,11 +1805,10 @@ body.log-modal-open {
     font-weight: 850;
     white-space: normal;
     text-align: center;
-    transition: transform 140ms ease, box-shadow 140ms ease;
+    transition: color 0.15s ease, background-color 0.15s ease;
 }
 
 .command-button:hover:not(:disabled) {
-    transform: translateY(-2px);
     box-shadow: 0 12px 22px rgba(39, 80, 150, 0.12);
 }
 
@@ -2346,29 +2252,6 @@ body.log-modal-open {
     text-align: center;
 }
 
-.data-source-panel {
-    position: fixed;
-    right: 18px;
-    bottom: 16px;
-    z-index: 30;
-    display: grid;
-    gap: 4px;
-    min-width: 150px;
-    padding: 10px 12px;
-    color: #496485;
-    border: 1px solid #dfe8f6;
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.88);
-    box-shadow: 0 12px 28px rgba(31, 82, 160, 0.12);
-    font-size: 12px;
-    font-weight: 700;
-    backdrop-filter: blur(12px);
-}
-
-.data-source-panel strong {
-    color: #0c1d44;
-}
-
 /* 黑白主题覆盖：这些规则统一卡片、图表、日志和按钮的前端颜色，不调用任何后端接口。 */
 .sidebar {
     border-right-color: var(--line);
@@ -2384,8 +2267,7 @@ body.log-modal-open {
 .legend,
 .summary-row,
 .system-log,
-td,
-.data-source-panel strong {
+td {
     color: var(--ink);
 }
 
@@ -2395,8 +2277,7 @@ td,
 .metric-change,
 .link-button,
 .system-log time,
-.footer,
-.data-source-panel {
+.footer {
     color: var(--muted);
 }
 
@@ -2405,8 +2286,7 @@ td,
 .device-card,
 .metric-card,
 .panel,
-.alert-summary,
-.data-source-panel {
+.alert-summary {
     border-color: var(--line);
     background: var(--panel);
 }
@@ -2772,17 +2652,6 @@ body[data-theme="light"] .command-button:disabled {
     box-shadow: none;
 }
 
-body[data-theme="light"] .data-source-panel {
-    color: #657894;
-    border-color: #e3ebf6;
-    background: rgba(255, 255, 255, 0.92);
-    box-shadow: 0 8px 22px rgba(35, 69, 120, 0.08);
-}
-
-body[data-theme="light"] .data-source-panel strong {
-    color: #162744;
-}
-
 /* Light theme readability: keep dashboard text on semantic theme colors. */
 body[data-theme="light"] {
     color: var(--text-primary);
@@ -2815,8 +2684,7 @@ body[data-theme="light"] .operation-log-title,
 body[data-theme="light"] .custom-command-form label,
 body[data-theme="light"] .command-modal-header h2,
 body[data-theme="light"] .command-modal p,
-body[data-theme="light"] td,
-body[data-theme="light"] .data-source-panel strong {
+body[data-theme="light"] td {
     color: var(--text-primary);
 }
 
@@ -2841,7 +2709,6 @@ body[data-theme="light"] .metric-change,
 body[data-theme="light"] .link-button,
 body[data-theme="light"] .system-log time,
 body[data-theme="light"] .footer,
-body[data-theme="light"] .data-source-panel,
 body[data-theme="light"] th,
 body[data-theme="light"] .device-online-table th,
 body[data-theme="light"] .s3-page-header p,
@@ -2894,6 +2761,10 @@ body[data-theme="light"] .command-modal {
     .s3-health-bar {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+
+    .s3-status-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
 }
 
 @media (max-width: 767px) {
@@ -2911,23 +2782,10 @@ body[data-theme="light"] .command-modal {
         gap: 10px;
     }
 
-    .card-update-meta {
-        align-items: flex-start;
-        flex-direction: column;
-        gap: 6px;
-    }
-
     .event-item {
         grid-template-columns: 58px 28px minmax(0, 1fr);
         gap: 8px;
         padding: 12px;
-    }
-}
-
-@media (prefers-reduced-motion: reduce) {
-    .value-increase,
-    .value-decrease {
-        transition: none;
     }
 }
 
@@ -2984,15 +2842,6 @@ body[data-theme="light"] .command-modal {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .csi-kpi-grid,
-    .csi-trend-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .csi-timeline {
-        grid-template-columns: repeat(9, minmax(0, 1fr));
-    }
-
     .middle-grid {
         grid-template-columns: 1fr;
     }
@@ -3002,7 +2851,6 @@ body[data-theme="light"] .command-modal {
         grid-template-columns: 1fr;
     }
 
-    .s3-status-grid,
     .s3-summary-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
@@ -3061,7 +2909,6 @@ body[data-theme="light"] .command-modal {
         pointer-events: none;
         background: rgba(2, 6, 23, 0.54);
         opacity: 0;
-        transition: opacity 160ms ease;
     }
 
     body.sidebar-open .sidebar-overlay {
@@ -3081,7 +2928,6 @@ body[data-theme="light"] .command-modal {
         border-right: 1px solid var(--line);
         border-bottom: 0;
         transform: translateX(-104%);
-        transition: transform 180ms ease;
     }
 
     body.sidebar-open .sidebar {
@@ -3177,19 +3023,6 @@ body[data-theme="light"] .command-modal {
         gap: 14px;
     }
 
-    .csi-grid {
-        padding-top: 14px;
-    }
-
-    .csi-kpi-grid,
-    .csi-trend-grid {
-        grid-template-columns: 1fr;
-    }
-
-    .csi-timeline {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
     .s3-page {
         padding: 16px 0 14px;
     }
@@ -3215,6 +3048,14 @@ body[data-theme="light"] .command-modal {
     .s3-activity-grid {
         grid-template-columns: 1fr;
         gap: 12px;
+    }
+
+    .s3-status-grid {
+        gap: 16px;
+    }
+
+    .s3-device-card {
+        grid-template-columns: 1fr;
     }
 
     .s3-module-row {
@@ -3463,12 +3304,6 @@ body[data-theme="light"] .command-modal {
 
     .confirm-modal .command-modal-actions {
         padding: 0 14px 14px;
-    }
-
-    .data-source-panel {
-        right: 10px;
-        bottom: 10px;
-        max-width: calc(100vw - 20px);
     }
 
     .log-modal-overlay {

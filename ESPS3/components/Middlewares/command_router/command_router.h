@@ -9,6 +9,7 @@
  * 把 ok/e ack 映射回 Server 错误码字符串。
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "esp_err.h"
@@ -19,6 +20,14 @@ extern "C" {
 
 /** @brief 初始化命令队列锁和本地状态；gateway_orchestrator_start() 调用。 */
 esp_err_t command_router_init(void);
+/** @brief 暂停指定 C5 的 Server pending 拉取和本地命令下发；幂等且不清队列。 */
+esp_err_t command_router_suspend_peer(const char *device_id);
+/** @brief 恢复指定 C5 的命令资源；幂等且不改变已有队列内容。 */
+esp_err_t command_router_restore_peer(const char *device_id);
+/** @brief 返回指定 C5 的命令资源是否已恢复。 */
+bool command_router_peer_active(const char *device_id);
+/** @brief 返回是否至少有一个 C5 的命令资源处于 active。 */
+bool command_router_has_active_peers(void);
 /** @brief 入队一条本地或 Server 命令；调试/Server pending ingest 调用。 */
 esp_err_t command_router_enqueue(const char *target_device_id,
                                  const char *command_type,

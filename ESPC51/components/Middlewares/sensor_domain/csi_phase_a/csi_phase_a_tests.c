@@ -38,16 +38,16 @@ bool csi_feature_test(char *summary, size_t summary_size)
 
     csi_feature_default_config(&config);
     config.calibration_duration_ms = 5000U;
-    config.min_calibration_samples = 8U;
+    config.min_calibration_samples = 50U;
     csi_feature_processor_init(&processor, &config);
 
     bool ok = true;
-    for (uint8_t sample = 0; sample < 12U; ++sample) {
-        fill_iq(iq_samples, 56U, 100, sample % 56U, (int16_t)(sample % 5U));
+    for (uint8_t sample = 0; sample < 51U; ++sample) {
+        fill_iq(iq_samples, 56U, 100, 0U, 0);
         ok = ok && csi_capture_build_frame_from_iq(iq_samples,
                                                    56U,
                                                    -48,
-                                                   (uint64_t)sample * 500U,
+                                                   (uint64_t)sample * 100U,
                                                    &frame);
         ok = ok && !csi_feature_processor_push(&processor, &frame, &feature);
     }
@@ -58,7 +58,7 @@ bool csi_feature_test(char *summary, size_t summary_size)
          selected <= CSI_PHASE_A_MAX_SELECTED_SUBCARRIERS;
 
     fill_iq(iq_samples, 56U, 100, 18U, 180);
-    ok = ok && csi_capture_build_frame_from_iq(iq_samples, 56U, -47, 7000U, &frame);
+    ok = ok && csi_capture_build_frame_from_iq(iq_samples, 56U, -47, 5100U, &frame);
     ok = ok && csi_feature_processor_push(&processor, &frame, &feature);
     ok = ok && feature.quality_state == CSI_SAMPLE_QUALITY_GOOD &&
          feature.metrics.quality > 0.0f &&
@@ -89,7 +89,7 @@ bool csi_feature_boundary_test(char *summary, size_t summary_size)
     if (summary != NULL && summary_size > 0U) {
         snprintf(summary,
                  summary_size,
-                 "boundary ok=1 state_decision_on_s3=1 c5_outputs_feature_only=1");
+                 "boundary ok=1 local_edge_state=1 c5_outputs_feature_only=1");
     }
     return true;
 }
@@ -107,6 +107,8 @@ bool csi_feature_payload_test(char *summary, size_t summary_size)
             .quality = 0.72f,
         },
         .state_hint = ENVELOPE_STATE_HINT_MOTION,
+        .motion_score = 0.61f,
+        .confidence = 0.81f,
         .quality_state = CSI_SAMPLE_QUALITY_GOOD,
     };
     char encoded[ENVELOPE_BUILDER_JSON_MAX_BYTES] = {0};
@@ -151,6 +153,37 @@ bool csi_feature_payload_test(char *summary, size_t summary_size)
               strstr(encoded, "\"v1\"") == NULL &&
               strstr(encoded, "\"v2\"") == NULL &&
               strstr(encoded, "\"v3\"") == NULL;
+    envelope_builder_input_t local_input = {
+        .local_id = "1",
+        .device_id = "C51",
+        .link_id = feature.link_id,
+        .timestamp_ms = (int64_t)feature.timestamp_ms,
+        .metrics = {
+            .frame_energy = feature.metrics.frame_energy,
+            .variance = feature.metrics.variance,
+            .cv = feature.metrics.cv,
+            .rssi = feature.metrics.rssi,
+            .quality = feature.metrics.quality,
+        },
+        .state_hint = feature.state_hint,
+        .motion_score = feature.motion_score,
+        .confidence = feature.confidence,
+        .source = ENVELOPE_BUILDER_SOURCE_CSI_PHASE_A,
+    };
+    char local_encoded[ENVELOPE_BUILDER_JSON_MAX_BYTES] = {0};
+    ret = envelope_builder_format_local_csi_report(&local_input,
+                                                   local_encoded,
+                                                   sizeof(local_encoded));
+    ok = ok && ret == ESP_OK &&
+         strstr(local_encoded, "motion_score") != NULL &&
+         strstr(local_encoded, "quality") != NULL &&
+         strstr(local_encoded, "rssi") != NULL &&
+         strstr(local_encoded, "energy") != NULL &&
+         strstr(local_encoded, "variance") != NULL &&
+         strstr(local_encoded, "\"cv\"") != NULL &&
+         strstr(local_encoded, "raw_csi") == NULL &&
+         strstr(local_encoded, "selected_subcarriers") == NULL &&
+         strstr(local_encoded, "subcarrier_data") == NULL;
     if (summary != NULL && summary_size > 0U) {
         snprintf(summary, summary_size, "payload ok=%d %s", ok ? 1 : 0, encoded);
     }

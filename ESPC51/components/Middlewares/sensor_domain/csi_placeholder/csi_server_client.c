@@ -1,6 +1,9 @@
 /**
  * @file csi_server_client.c
- * @brief C5 CSI feature upload client.
+ * @brief C5 CSI feature 本地上报客户端。
+ *
+ * 本文件只负责把 csi_phase_a 生成的轻量 feature 格式化成 v2 envelope，并 POST 到
+ * ESPS3 /local/v1/csi/result；不会构造 ESP-server payload，也不会携带 raw CSI。
  */
 
 #include "csi_server_client.h"
@@ -23,6 +26,9 @@ static const char *TAG = "csi_server_client";
 #define CSI_FEATURE_HTTP_TIMEOUT_MS 5000U
 #endif
 
+#define CSI_LOCAL_LINK_ID "S3_TO_C51"
+#define CSI_LOCAL_REPORT_ID "1"
+
 esp_err_t csi_server_client_init(void)
 {
     return ESP_OK;
@@ -30,12 +36,12 @@ esp_err_t csi_server_client_init(void)
 
 const char *csi_server_client_local_link_id(void)
 {
-    return terminal_config_get_local_id() == ESP111_PROTOCOL_LOCAL_DEVICE_ID_C52 ? "S3_TO_C52" : "S3_TO_C51";
+    return CSI_LOCAL_LINK_ID;
 }
 
 static const char *csi_server_client_local_report_id(void)
 {
-    return terminal_config_get_local_id() == ESP111_PROTOCOL_LOCAL_DEVICE_ID_C52 ? "C52" : "C51";
+    return CSI_LOCAL_REPORT_ID;
 }
 
 static esp_err_t format_feature_report(const csi_feature_frame_t *result,
@@ -55,11 +61,14 @@ static esp_err_t format_feature_report(const csi_feature_frame_t *result,
         .quality = result->metrics.quality,
     };
     envelope_builder_input_t input = {
-        .device_id = csi_server_client_local_report_id(),
+        .local_id = csi_server_client_local_report_id(),
+        .device_id = terminal_config_get_device_id(),
         .link_id = feature_link_id,
         .timestamp_ms = (int64_t)result->timestamp_ms,
         .metrics = metrics,
         .state_hint = result->state_hint,
+        .motion_score = result->motion_score,
+        .confidence = result->confidence,
         .source = ENVELOPE_BUILDER_SOURCE_CSI_PHASE_A,
     };
     return envelope_builder_format_local_csi_report(&input, json_body, json_body_size);
@@ -89,9 +98,12 @@ esp_err_t csi_server_client_publish_feature_result(const csi_feature_frame_t *re
     }
     if (log_enabled) {
         ESP_LOGI(TAG,
-                 "CSI_TX id=%s lid=%s t=%llu v=[%.6g,%.6g,%.6g,%d,%.6g]",
+                 "CSI_TX id=%s lid=%s state=%s motion_score=%.3f confidence=%.3f t=%llu v=[%.6g,%.6g,%.6g,%d,%.6g]",
                  feature_id,
                  feature_link_id,
+                 envelope_builder_state_hint_to_string(result->state_hint),
+                 (double)result->motion_score,
+                 (double)result->confidence,
                  (unsigned long long)result->timestamp_ms,
                  (double)result->metrics.frame_energy,
                  (double)result->metrics.variance,

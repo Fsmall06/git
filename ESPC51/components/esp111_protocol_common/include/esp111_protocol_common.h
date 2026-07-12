@@ -165,6 +165,9 @@ extern "C" {
 #define ESP111_PROTOCOL_ROUTE_COMMAND_ACK_WILDCARD "/local/v1/commands/*/ack"
 
 /* 语音边界：C5 上传/接收 PCM，S3 只代理，ASR/LLM/TTS 具体实现位于 Server 侧。 */
+#ifndef VOICE_REQUEST_TIMEOUT_MS
+#define VOICE_REQUEST_TIMEOUT_MS 90000U
+#endif
 #define ESP111_PROTOCOL_AUDIO_CONTENT_TYPE_L16_16K_MONO \
     "audio/L16; rate=16000; channels=1"
 #define ESP111_PROTOCOL_AUDIO_RESPONSE_CONTENT_TYPE "audio/L16"

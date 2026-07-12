@@ -13,13 +13,16 @@ const {
     readModuleStatuses
 } = require("../services/deviceStatusService");
 const {
-    ingestCanonicalCsiEventV2
+    persistCanonicalCsiEventV2,
+    prepareCanonicalCsiEventV2
 } = require("../services/csiMotionService");
 const {
-    ingestBme690
+    persistBme690Ingest,
+    prepareBme690Ingest
 } = require("../services/sensorBme690Service");
 const {
-    ingestDashboardSnapshot
+    persistDashboardSnapshot,
+    prepareDashboardSnapshot
 } = require("../services/dashboardService");
 const {
     bindDeviceToGateway,
@@ -30,6 +33,15 @@ const {
     apiEnvelope,
     apiError
 } = require("../utils/apiEnvelope");
+const {
+    resolveDeviceId
+} = require("../services/deviceIdResolver");
+const {
+    PRIORITY_HIGH,
+    PRIORITY_LOW,
+    PRIORITY_MEDIUM,
+    enqueuePersistenceJob
+} = require("../services/persistenceQueue");
 
 function parseJsonObject(value, fallback = {}) {
     if (!value) {
@@ -56,7 +68,7 @@ function mapLatestSensor(row) {
         humidity: row.humidity,
         pressure: row.pressure,
         gas_resistance: row.gas_resistance,
-        device_id: row.device_id,
+        device_id: resolveDeviceId(row.device_id),
         esp_time_ms: row.esp_time_ms,
         esp_uptime_ms: row.esp_uptime_ms,
         server_recv_ms: row.server_recv_ms,
@@ -81,11 +93,12 @@ function mapLatestSensor(row) {
 }
 
 async function readLatestSensor(dbAll, deviceId) {
+    const resolvedDeviceId = resolveDeviceId(deviceId);
     const params = [];
     let where = "WHERE deleted_at IS NULL AND (payload_type='sensor.bme690' OR payload_type IS NULL OR payload_type='')";
-    if (deviceId) {
+    if (resolvedDeviceId) {
         where += " AND device_id=?";
-        params.push(deviceId);
+        params.push(resolvedDeviceId);
     }
 
     const rows = await dbAll(
@@ -103,9 +116,13 @@ function createDeviceRouter(options) {
     const dbRun = options.dbRun;
     const dbAll = options.dbAll;
     const logger = options.logger || console;
+    const runtimeCache = options.runtimeCache;
+    const persistenceWorker = options.persistenceWorker;
     const gatewayContext = {
         dbRun,
-        dbAll
+        dbAll,
+        enqueuePersistenceJob,
+        persistenceWorker
     };
     const gatewayOnly = requireGatewayAuth(gatewayContext);
 
@@ -134,7 +151,7 @@ function createDeviceRouter(options) {
         }
 
         try {
-            const result = await ingestBme690(dbRun, dbAll, req.body, {
+            const result = prepareBme690Ingest(req.body, {
                 headers: req.headers,
                 query: req.query,
                 serverRecvMs,
@@ -152,8 +169,18 @@ function createDeviceRouter(options) {
                 }));
             }
 
+            runtimeCache?.updateBmeSensor?.(result, {
+                serverRecvMs
+            });
+            const queued = enqueuePersistenceJob({
+                type: "sensor.bme690",
+                priority: result.hasAlarm ? PRIORITY_HIGH : PRIORITY_MEDIUM,
+                run: () => persistBme690Ingest(dbRun, dbAll, result)
+            });
+            persistenceWorker?.scheduleImmediateFlushIfNeeded?.();
+
             logger.log(
-                `[device-v1] ingest payload_type=${result.data.payload_type} device_id=${result.data.device_id || "-"} id=${result.data.id ?? "-"} upload_delay_ms=${result.data.upload_delay_ms ?? "null"}`
+                `[device-v1] ingest queued payload_type=${result.data.payload_type} device_id=${result.data.device_id || "-"} job_id=${queued.job_id} priority=${queued.priority} upload_delay_ms=${result.data.upload_delay_ms ?? "null"}`
             );
 
             return res.status(result.status).json(makeDeviceEnvelope({
@@ -195,7 +222,7 @@ function createDeviceRouter(options) {
         }
 
         try {
-            const result = await ingestCanonicalCsiEventV2(dbRun, dbAll, req.body, {
+            const result = prepareCanonicalCsiEventV2(req.body, {
                 headers: req.headers,
                 query: req.query,
                 serverRecvMs,
@@ -215,8 +242,29 @@ function createDeviceRouter(options) {
                 }));
             }
 
+            const cacheRecord = runtimeCache?.updateCsiMotion?.({
+                ...result.fact,
+                confidence: result.validation.csi.confidence,
+                fused_state: result.fact.state
+            }, {
+                serverRecvMs
+            });
+            result.data.dashboard_recorded = Boolean(cacheRecord);
+            const queued = enqueuePersistenceJob({
+                type: "csi.motion",
+                priority: PRIORITY_LOW,
+                run: () => persistCanonicalCsiEventV2(dbRun, dbAll, result)
+            });
+            persistenceWorker?.scheduleImmediateFlushIfNeeded?.();
+
+            if (queued.csi?.dropped > 0 || queued.csi?.coalesced > 0) {
+                logger.warn(
+                    `[CSI_PERSIST_QUEUE] length=${queued.csi.length} dropped=${queued.csi.dropped} coalesced=${queued.csi.coalesced}`
+                );
+            }
+
             logger.log(
-                `[kernel-csi] accepted trace_id=${result.data.trace_id} tick_id=${result.data.tick_id} state=${result.data.state} gateway_id=${boundGateway.gateway_id}`
+                `[kernel-csi] queued trace_id=${result.data.trace_id} tick_id=${result.data.tick_id} state=${result.data.state} gateway_id=${boundGateway.gateway_id} job_id=${queued.job_id}`
             );
 
             return res.status(result.status).json(makeDeviceEnvelope({
@@ -242,9 +290,7 @@ function createDeviceRouter(options) {
         const gatewayId = req.gatewayAuth?.gateway_id || "";
 
         try {
-            const result = await ingestDashboardSnapshot(req.body, {
-                dbRun,
-                dbAll,
+            const result = prepareDashboardSnapshot(req.body, {
                 headers: req.headers,
                 serverRecvMs,
                 trustedGatewayId: gatewayId
@@ -261,11 +307,23 @@ function createDeviceRouter(options) {
             }
 
             logger.log(
-                `[device-v1] gateway-state gateway_id=${result.data.gateway_id || "-"} devices=${result.data.device_count}`
+                `[device-v1] gateway-state queued gateway_id=${result.data.gateway_id || "-"} devices=${result.data.device_count}`
             );
-            for (const deviceId of result.data.bound_device_ids || []) {
-                await bindDeviceToGateway(dbRun, gatewayId, deviceId, "gateway_state", serverRecvMs, dbAll);
-            }
+            runtimeCache?.updateDashboardSnapshot?.(result.snapshot, {
+                serverRecvMs
+            });
+            const queued = enqueuePersistenceJob({
+                type: "gateway.dashboard_snapshot",
+                priority: PRIORITY_HIGH,
+                run: async () => {
+                    await persistDashboardSnapshot(dbRun, dbAll, result);
+                    for (const deviceId of result.data.bound_device_ids || []) {
+                        await bindDeviceToGateway(dbRun, gatewayId, deviceId, "gateway_state", serverRecvMs, dbAll);
+                    }
+                }
+            });
+            persistenceWorker?.scheduleImmediateFlushIfNeeded?.();
+            logger.log(`[device-v1] gateway-state job_id=${queued.job_id} priority=${queued.priority}`);
 
             return res.status(result.status).json(makeDeviceEnvelope({
                 ok: true,
@@ -288,7 +346,7 @@ function createDeviceRouter(options) {
     async function sendDeviceStatus(req, res, forcedDeviceId = "") {
         const nowMs = Date.now();
         await markTimedOutDevices(dbRun, dbAll, nowMs);
-        const deviceId = trimText(forcedDeviceId || req.query.device_id, 128);
+        const deviceId = resolveDeviceId(forcedDeviceId || req.query.device_id);
         const devices = await readDeviceStatuses(dbAll, {
             device_id: deviceId
         }, nowMs);
@@ -325,7 +383,7 @@ function createDeviceRouter(options) {
     });
 
     router.get("/api/device/v1/modules/status", async (req, res) => {
-        const deviceId = trimText(req.query.device_id, 128);
+        const deviceId = resolveDeviceId(req.query.device_id);
         const modules = await readModuleStatuses(dbAll, deviceId);
         return res.json({
             ok: true,
@@ -335,7 +393,7 @@ function createDeviceRouter(options) {
     });
 
     router.get("/api/device/v1/context", async (req, res) => {
-        const deviceId = trimText(req.query.device_id, 128);
+        const deviceId = resolveDeviceId(req.query.device_id);
         const context = await getDeviceContext(dbAll, deviceId);
         return res.json({
             ok: true,
@@ -345,7 +403,7 @@ function createDeviceRouter(options) {
     });
 
     router.get("/api/device/v1/sensors/latest", async (req, res) => {
-        const deviceId = trimText(req.query.device_id, 128);
+        const deviceId = resolveDeviceId(req.query.device_id);
         const row = await readLatestSensor(dbAll, deviceId);
         return res.json({
             ok: true,

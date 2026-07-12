@@ -3,12 +3,12 @@
 
 /**
  * @file csi_fusion.h
- * @brief ESPS3 CSI tick-aligned canonical event fusion and state machine.
+ * @brief ESPS3 CSI tick 对齐融合和 canonical event 状态机。
  *
- * S3 owns only time alignment, link pairing, IDLE/MOTION/HOLD state decisions,
- * and CanonicalEvent v2 generation. Inputs are C5-provided state/confidence
- * observations; raw CSI, subcarrier, energy, variance, and CV math stay out of
- * this module.
+ * S3 只负责时间对齐、链路配对、IDLE/MOTION/HOLD 状态决策和 CanonicalEvent v2
+ * 生成。输入来自 C5 上报的 motion_score、quality、RSSI 和低维 metrics；C5 state
+ * 只作为 local_hint 日志，不直接决定 S3 状态。raw CSI、I/Q、phase 和 subcarrier
+ * 数据都不进入本模块。
  */
 
 #include <stdbool.h>
@@ -42,12 +42,18 @@ typedef struct {
     char trace_id[CSI_FUSION_TRACE_ID_LEN];
     bool has_state;
     csi_fusion_state_t state;
+    float motion_score;
     float confidence;
     float quality;
     int rssi;
+    bool has_metrics;
+    float energy;
+    float variance;
+    float cv;
     uint32_t frame_seq;
     uint64_t tick_id;
     uint64_t timestamp_ms;
+    uint64_t child_timestamp_ms;
 } csi_fusion_feature_t;
 
 typedef struct {
@@ -57,9 +63,14 @@ typedef struct {
     char trace_id[CSI_FUSION_TRACE_ID_LEN];
     bool has_state;
     csi_fusion_state_t state;
+    float motion_score;
     float confidence;
     float quality;
     int rssi;
+    bool has_metrics;
+    float energy;
+    float variance;
+    float cv;
     uint32_t frame_seq;
     uint64_t tick_id;
     uint64_t timestamp_ms;
@@ -72,6 +83,7 @@ typedef struct {
     uint64_t tick_id;
     char links[CSI_FUSION_LINK_COUNT][CSI_FUSION_TEXT_LEN];
     csi_fusion_state_t fused_state;
+    float motion_score;
     float confidence;
     uint64_t timestamp_ms;
     uint8_t active_link_count;
@@ -81,6 +93,15 @@ typedef csi_fusion_canonical_event_t csi_fusion_telemetry_t;
 typedef csi_fusion_canonical_event_t csi_fusion_fact_t;
 
 void csi_fusion_init(void);
+
+/** @brief 立即停用指定 C5 的融合链路并清空实时样本。调用方负责串行化。 */
+esp_err_t csi_fusion_suspend_link(const char *device_id);
+
+/** @brief 恢复指定 C5 的融合链路并从 5 个不同 tick 的 warmup 重新开始。 */
+esp_err_t csi_fusion_restore_link(const char *device_id);
+
+/** @brief Query whether the restored link has accepted its full warmup sample set. */
+bool csi_fusion_link_warmup_complete(const char *device_id);
 
 esp_err_t csi_fusion_update(const csi_fusion_feature_t *feature,
                             csi_fusion_fact_t *out_fact,

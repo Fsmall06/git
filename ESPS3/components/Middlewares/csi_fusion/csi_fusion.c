@@ -5,18 +5,33 @@
 
 #include "csi_fusion.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "esp111_protocol_common.h"
 
-#define CSI_FUSION_STALE_TICKS 5ULL
+#define CSI_FUSION_SAMPLE_FRESH_MS 3000ULL
+#define CSI_FUSION_EMPTY_LOG_MS 1000ULL
+#define CSI_FUSION_RESTORE_WARMUP_TICKS 5U
 #define CSI_FUSION_T_HIGH 0.62f
 #define CSI_FUSION_T_LOW 0.30f
-#define CSI_FUSION_CONFIRM_TICKS 2U
-#define CSI_FUSION_HOLD_TICKS 3U
-#define CSI_FUSION_MIN_WEIGHT 0.01f
+#define CSI_FUSION_CONFIRM_TICKS 5U
+#define CSI_FUSION_HOLD_TICKS 20U
+#define CSI_FUSION_RSSI_STRONG_DBM (-45)
+#define CSI_FUSION_RSSI_WEAK_DBM (-90)
+#define CSI_FUSION_RSSI_UNKNOWN_WEIGHT 0.75f
+#define CSI_FUSION_VARIANCE_IDLE 80.0f
+#define CSI_FUSION_VARIANCE_MOTION 260.0f
+#define CSI_FUSION_CV_IDLE 0.08f
+#define CSI_FUSION_CV_MOTION 0.22f
+#define CSI_FUSION_ENERGY_REFERENCE 24.0f
+#define CSI_FUSION_MOTION_SCORE_WEIGHT 0.70f
+#define CSI_FUSION_METRICS_SCORE_WEIGHT 0.30f
+
+static const char *TAG = "csi_fusion";
 
 typedef struct {
     bool valid;
@@ -25,9 +40,12 @@ typedef struct {
 
 typedef struct {
     bool configured;
+    bool active;
+    uint8_t warmup_tick_count;
+    uint64_t last_warmup_tick_id;
     char name[CSI_FUSION_TEXT_LEN];
     char primary_link_id[CSI_FUSION_TEXT_LEN];
-    csi_fusion_tick_sample_t pending_sample;
+    csi_fusion_tick_sample_t latest_sample;
 } csi_fusion_link_t;
 
 static csi_fusion_link_t s_links[CSI_FUSION_LINK_COUNT];
@@ -36,8 +54,13 @@ static uint8_t s_motion_candidate_ticks;
 static uint8_t s_idle_candidate_ticks;
 static uint64_t s_current_tick_id;
 static uint64_t s_last_finalized_tick_id;
+static uint64_t s_last_empty_log_ms;
 static bool s_has_current_tick;
 static bool s_has_finalized_tick;
+
+static bool sample_age_ms(const csi_fusion_tick_sample_t *sample,
+                          uint64_t reference_ms,
+                          uint64_t *out_age_ms);
 
 static float clamp01(float value)
 {
@@ -48,6 +71,80 @@ static float clamp01(float value)
         return 1.0f;
     }
     return value;
+}
+
+static float freshness_weight_for_sample(const csi_fusion_tick_sample_t *sample,
+                                         uint64_t reference_ms)
+{
+    uint64_t age_ms = 0ULL;
+    if (!sample_age_ms(sample, reference_ms, &age_ms) ||
+        age_ms >= CSI_FUSION_SAMPLE_FRESH_MS) {
+        return 0.0f;
+    }
+    return 1.0f - ((float)age_ms / (float)CSI_FUSION_SAMPLE_FRESH_MS);
+}
+
+static float rssi_weight(int rssi)
+{
+    if (rssi == 0) {
+        return CSI_FUSION_RSSI_UNKNOWN_WEIGHT;
+    }
+    if (rssi >= CSI_FUSION_RSSI_STRONG_DBM) {
+        return 1.0f;
+    }
+    if (rssi <= CSI_FUSION_RSSI_WEAK_DBM) {
+        return 0.15f;
+    }
+
+    float span = (float)(CSI_FUSION_RSSI_STRONG_DBM - CSI_FUSION_RSSI_WEAK_DBM);
+    float normalized = (float)(rssi - CSI_FUSION_RSSI_WEAK_DBM) / span;
+    return 0.15f + (0.85f * clamp01(normalized));
+}
+
+static float normalize_metric_range(float value, float low, float high)
+{
+    if (!isfinite(value) || high <= low) {
+        return 0.0f;
+    }
+    return clamp01((value - low) / (high - low));
+}
+
+static float normalize_energy(float energy)
+{
+    if (!isfinite(energy) || energy <= 0.0f) {
+        return 0.0f;
+    }
+    return clamp01(energy / (energy + CSI_FUSION_ENERGY_REFERENCE));
+}
+
+static float metrics_motion_score(const csi_fusion_link_state_t *state)
+{
+    if (state == NULL || !state->valid || !state->has_metrics) {
+        return state != NULL && state->valid ? clamp01(state->motion_score) : 0.0f;
+    }
+
+    float metric_score =
+        (0.20f * normalize_energy(state->energy)) +
+        (0.45f * normalize_metric_range(state->variance,
+                                        CSI_FUSION_VARIANCE_IDLE,
+                                        CSI_FUSION_VARIANCE_MOTION)) +
+        (0.35f * normalize_metric_range(state->cv,
+                                        CSI_FUSION_CV_IDLE,
+                                        CSI_FUSION_CV_MOTION));
+    return clamp01((CSI_FUSION_MOTION_SCORE_WEIGHT * clamp01(state->motion_score)) +
+                   (CSI_FUSION_METRICS_SCORE_WEIGHT * metric_score));
+}
+
+static float base_weight_for_fusion(const csi_fusion_link_state_t *state,
+                                    const csi_fusion_tick_sample_t *sample,
+                                    uint64_t reference_ms)
+{
+    if (state == NULL || !state->valid) {
+        return 0.0f;
+    }
+    return clamp01(state->quality) *
+           freshness_weight_for_sample(sample, reference_ms) *
+           rssi_weight(state->rssi);
 }
 
 static uint64_t now_ms(void)
@@ -65,12 +162,56 @@ static uint64_t timestamp_for_tick(uint64_t tick_id)
     return tick_id * (uint64_t)CSI_FUSION_TICK_MS;
 }
 
-static uint64_t feature_timestamp_ms(const csi_fusion_feature_t *feature)
+static uint64_t sample_timestamp_ms(const csi_fusion_tick_sample_t *sample)
 {
-    if (feature != NULL && feature->timestamp_ms > 0ULL) {
-        return feature->timestamp_ms;
+    if (sample == NULL || !sample->valid || sample->feature.timestamp_ms == 0ULL) {
+        return 0ULL;
     }
-    return now_ms();
+    return sample->feature.timestamp_ms;
+}
+
+static bool sample_age_ms(const csi_fusion_tick_sample_t *sample,
+                          uint64_t reference_ms,
+                          uint64_t *out_age_ms)
+{
+    uint64_t sample_ms = sample_timestamp_ms(sample);
+    if (sample_ms == 0ULL || out_age_ms == NULL) {
+        return false;
+    }
+    *out_age_ms = sample_ms > reference_ms ? 0ULL : reference_ms - sample_ms;
+    return true;
+}
+
+static int64_t sample_age_log_ms(const csi_fusion_tick_sample_t *sample,
+                                 uint64_t reference_ms)
+{
+    uint64_t age_ms = 0ULL;
+    if (!sample_age_ms(sample, reference_ms, &age_ms)) {
+        return -1;
+    }
+    return age_ms > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)age_ms;
+}
+
+static bool sample_is_fresh(const csi_fusion_tick_sample_t *sample,
+                            uint64_t reference_ms,
+                            uint64_t *out_age_ms)
+{
+    uint64_t age_ms = 0ULL;
+    if (!sample_age_ms(sample, reference_ms, &age_ms)) {
+        return false;
+    }
+    if (out_age_ms != NULL) {
+        *out_age_ms = age_ms;
+    }
+    return age_ms <= CSI_FUSION_SAMPLE_FRESH_MS;
+}
+
+static uint64_t feature_tick_id(const csi_fusion_feature_t *feature)
+{
+    if (feature != NULL && feature->tick_id > 0ULL) {
+        return feature->tick_id;
+    }
+    return tick_id_for_timestamp(now_ms());
 }
 
 static void reset_state_to_idle(void)
@@ -78,6 +219,26 @@ static void reset_state_to_idle(void)
     s_state = CSI_FUSION_STATE_IDLE;
     s_motion_candidate_ticks = 0U;
     s_idle_candidate_ticks = 0U;
+}
+
+static bool any_link_active(void)
+{
+    for (size_t i = 0; i < CSI_FUSION_LINK_COUNT; ++i) {
+        if (s_links[i].configured && s_links[i].active) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void reset_global_runtime(void)
+{
+    reset_state_to_idle();
+    s_current_tick_id = 0ULL;
+    s_last_finalized_tick_id = 0ULL;
+    s_last_empty_log_ms = 0ULL;
+    s_has_current_tick = false;
+    s_has_finalized_tick = false;
 }
 
 static void reset_link(csi_fusion_link_t *link,
@@ -89,6 +250,7 @@ static void reset_link(csi_fusion_link_t *link,
     }
     memset(link, 0, sizeof(*link));
     link->configured = true;
+    link->active = false;
     strlcpy(link->name, name, sizeof(link->name));
     strlcpy(link->primary_link_id, primary_link_id, sizeof(link->primary_link_id));
 }
@@ -97,11 +259,7 @@ void csi_fusion_init(void)
 {
     reset_link(&s_links[0], "C51", "S3_TO_C51");
     reset_link(&s_links[1], "C52", "S3_TO_C52");
-    reset_state_to_idle();
-    s_current_tick_id = 0ULL;
-    s_last_finalized_tick_id = 0ULL;
-    s_has_current_tick = false;
-    s_has_finalized_tick = false;
+    reset_global_runtime();
 }
 
 const char *csi_fusion_link_state_name(size_t index)
@@ -117,57 +275,96 @@ static int link_index_for_feature(const csi_fusion_feature_t *feature)
     if (feature == NULL) {
         return -1;
     }
-    if (strcmp(feature->link_id, "S3_TO_C51") == 0 ||
-        strcmp(feature->link_id, "C52_TO_C51") == 0 ||
-        strcmp(feature->link_id, "C51") == 0 ||
-        strcmp(feature->device_id, "C51") == 0 ||
-        strcmp(feature->device_id, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C51) == 0) {
+    if (strcmp(feature->link_id, "S3_TO_C51") == 0) {
         return 0;
     }
-    if (strcmp(feature->link_id, "S3_TO_C52") == 0 ||
-        strcmp(feature->link_id, "C51_TO_C52") == 0 ||
-        strcmp(feature->link_id, "C52") == 0 ||
-        strcmp(feature->device_id, "C52") == 0 ||
-        strcmp(feature->device_id, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C52) == 0) {
+    if (strcmp(feature->link_id, "S3_TO_C52") == 0) {
         return 1;
     }
     return -1;
+}
+
+static int link_index_for_device_id(const char *device_id)
+{
+    if (device_id == NULL || device_id[0] == '\0') {
+        return -1;
+    }
+    if (strcmp(device_id, "C51") == 0 ||
+        strcmp(device_id, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C51) == 0) {
+        return 0;
+    }
+    if (strcmp(device_id, "C52") == 0 ||
+        strcmp(device_id, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C52) == 0) {
+        return 1;
+    }
+    return -1;
+}
+
+esp_err_t csi_fusion_suspend_link(const char *device_id)
+{
+    int link_index = link_index_for_device_id(device_id);
+    if (link_index < 0 || link_index >= (int)CSI_FUSION_LINK_COUNT) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    csi_fusion_link_t *link = &s_links[link_index];
+    const bool was_active = link->active;
+    link->active = false;
+    link->warmup_tick_count = 0U;
+    link->last_warmup_tick_id = 0ULL;
+    memset(&link->latest_sample, 0, sizeof(link->latest_sample));
+
+    if (was_active) {
+        /* A topology change invalidates fused hysteresis even if another link remains active. */
+        reset_global_runtime();
+    }
+    return ESP_OK;
+}
+
+esp_err_t csi_fusion_restore_link(const char *device_id)
+{
+    int link_index = link_index_for_device_id(device_id);
+    if (link_index < 0 || link_index >= (int)CSI_FUSION_LINK_COUNT) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    csi_fusion_link_t *link = &s_links[link_index];
+    if (link->active) {
+        return ESP_OK;
+    }
+
+    /* Rejoining links start from a fresh fused tick/state boundary. */
+    reset_global_runtime();
+    memset(&link->latest_sample, 0, sizeof(link->latest_sample));
+    link->warmup_tick_count = 0U;
+    link->last_warmup_tick_id = 0ULL;
+    link->active = true;
+    return ESP_OK;
+}
+
+bool csi_fusion_link_warmup_complete(const char *device_id)
+{
+    int link_index = link_index_for_device_id(device_id);
+    if (link_index < 0 || link_index >= (int)CSI_FUSION_LINK_COUNT) {
+        return false;
+    }
+
+    const csi_fusion_link_t *link = &s_links[link_index];
+    return link->active &&
+           link->warmup_tick_count >= CSI_FUSION_RESTORE_WARMUP_TICKS &&
+           link->latest_sample.valid;
 }
 
 static bool feature_valid_for_fusion(const csi_fusion_feature_t *feature)
 {
     return feature != NULL &&
            feature->link_id[0] != '\0' &&
+           feature->motion_score >= 0.0f &&
+           feature->motion_score <= 1.0f &&
            feature->confidence >= 0.0f &&
            feature->confidence <= 1.0f &&
            feature->quality >= 0.0f &&
            feature->quality <= 1.0f;
-}
-
-static float freshness_for_ticks(uint64_t sample_tick, uint64_t tick_id)
-{
-    if (sample_tick > tick_id) {
-        return 1.0f;
-    }
-    uint64_t age_ticks = tick_id - sample_tick;
-    if (age_ticks >= CSI_FUSION_STALE_TICKS) {
-        return 0.0f;
-    }
-    float freshness = 1.0f - ((float)age_ticks / (float)CSI_FUSION_STALE_TICKS);
-    return freshness > CSI_FUSION_MIN_WEIGHT ? freshness : CSI_FUSION_MIN_WEIGHT;
-}
-
-static float link_weight(const csi_fusion_link_state_t *state, uint64_t tick_id)
-{
-    if (state == NULL || !state->valid) {
-        return 0.0f;
-    }
-    float quality = clamp01(state->quality);
-    if (quality <= 0.0f) {
-        return 0.0f;
-    }
-    float freshness = freshness_for_ticks(state->tick_id, tick_id);
-    return quality * freshness;
 }
 
 static csi_fusion_link_state_t link_state_from_feature(const csi_fusion_feature_t *feature,
@@ -185,23 +382,29 @@ static csi_fusion_link_state_t link_state_from_feature(const csi_fusion_feature_
     strlcpy(out.trace_id, feature->trace_id, sizeof(out.trace_id));
     out.has_state = feature->has_state;
     out.state = feature->state;
+    out.motion_score = clamp01(feature->motion_score);
     out.confidence = clamp01(feature->confidence);
     out.quality = clamp01(feature->quality);
     out.rssi = feature->rssi;
+    out.has_metrics = feature->has_metrics;
+    out.energy = feature->energy;
+    out.variance = feature->variance;
+    out.cv = feature->cv;
     out.frame_seq = feature->frame_seq;
     out.tick_id = tick_id;
-    out.timestamp_ms = timestamp_for_tick(tick_id);
+    out.timestamp_ms = feature->timestamp_ms > 0ULL ? feature->timestamp_ms :
+                                                       timestamp_for_tick(tick_id);
     return out;
 }
 
-static void update_state_machine(float confidence, uint8_t active_link_count)
+static void update_state_machine(float motion_score, uint8_t active_link_count)
 {
     if (active_link_count == 0U) {
-        confidence = 0.0f;
+        return;
     }
 
-    bool motion_evidence = confidence >= CSI_FUSION_T_HIGH;
-    bool idle_evidence = confidence <= CSI_FUSION_T_LOW;
+    bool motion_evidence = motion_score >= CSI_FUSION_T_HIGH;
+    bool idle_evidence = motion_score <= CSI_FUSION_T_LOW;
 
     if (s_state == CSI_FUSION_STATE_IDLE) {
         s_idle_candidate_ticks = 0U;
@@ -243,27 +446,6 @@ static void update_state_machine(float confidence, uint8_t active_link_count)
     }
 }
 
-static bool tick_has_all_links(uint64_t tick_id)
-{
-    for (size_t i = 0; i < CSI_FUSION_LINK_COUNT; ++i) {
-        if (!s_links[i].pending_sample.valid ||
-            tick_id_for_timestamp(feature_timestamp_ms(&s_links[i].pending_sample.feature)) != tick_id) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static void clear_tick_samples(uint64_t tick_id)
-{
-    for (size_t i = 0; i < CSI_FUSION_LINK_COUNT; ++i) {
-        if (s_links[i].pending_sample.valid &&
-            tick_id_for_timestamp(feature_timestamp_ms(&s_links[i].pending_sample.feature)) == tick_id) {
-            memset(&s_links[i].pending_sample, 0, sizeof(s_links[i].pending_sample));
-        }
-    }
-}
-
 static void trace_id_for_event(const csi_fusion_link_state_t *links,
                                char *out,
                                size_t out_size,
@@ -282,6 +464,24 @@ static void trace_id_for_event(const csi_fusion_link_state_t *links,
     }
 
     (void)snprintf(out, out_size, "csi-v2-%llu", (unsigned long long)tick_id);
+}
+
+static void log_empty_fusion_if_due(uint64_t reference_ms)
+{
+    if (!any_link_active()) {
+        return;
+    }
+    if (s_last_empty_log_ms != 0ULL &&
+        reference_ms - s_last_empty_log_ms < CSI_FUSION_EMPTY_LOG_MS) {
+        return;
+    }
+    s_last_empty_log_ms = reference_ms;
+    ESP_LOGW(TAG,
+             "CSI_FUSION_EMPTY reason=no_fresh_sample now_ms=%llu c51_age_ms=%lld c52_age_ms=%lld fresh_ms=%llu",
+             (unsigned long long)reference_ms,
+             (long long)sample_age_log_ms(&s_links[0].latest_sample, reference_ms),
+             (long long)sample_age_log_ms(&s_links[1].latest_sample, reference_ms),
+             (unsigned long long)CSI_FUSION_SAMPLE_FRESH_MS);
 }
 
 static void copy_event_outputs(const csi_fusion_canonical_event_t *event,
@@ -311,34 +511,60 @@ static bool finalize_tick(uint64_t tick_id,
     }
 
     csi_fusion_link_state_t link_states[CSI_FUSION_LINK_COUNT] = {0};
-    float weighted_confidence = 0.0f;
+    float weighted_motion_score = 0.0f;
     float weight_total = 0.0f;
     uint8_t active_link_count = 0U;
+    uint64_t reference_ms = now_ms();
+    uint64_t tick_ms = timestamp_for_tick(tick_id);
+    if (tick_ms > reference_ms) {
+        reference_ms = tick_ms;
+    }
 
     for (size_t i = 0; i < CSI_FUSION_LINK_COUNT; ++i) {
         csi_fusion_link_t *link = &s_links[i];
-        if (link->pending_sample.valid &&
-            tick_id_for_timestamp(feature_timestamp_ms(&link->pending_sample.feature)) == tick_id) {
-            link_states[i] = link_state_from_feature(&link->pending_sample.feature, link, tick_id);
+        if (!link->active) {
+            continue;
+        }
+        if (sample_is_fresh(&link->latest_sample, reference_ms, NULL)) {
+            link_states[i] = link_state_from_feature(&link->latest_sample.feature, link, tick_id);
         }
 
-        float weight = link_weight(&link_states[i], tick_id);
+        float weight = base_weight_for_fusion(&link_states[i],
+                                              &link->latest_sample,
+                                              reference_ms);
         if (weight <= 0.0f) {
             continue;
         }
-        weighted_confidence += link_states[i].confidence * weight;
+        weighted_motion_score += metrics_motion_score(&link_states[i]) * weight;
         weight_total += weight;
         ++active_link_count;
     }
 
-    float confidence = weight_total > 0.0f ? clamp01(weighted_confidence / weight_total) : 0.0f;
-    update_state_machine(confidence, active_link_count);
+    float motion_score = weight_total > 0.0f ? clamp01(weighted_motion_score / weight_total) : 0.0f;
+    float confidence = active_link_count > 0U ? clamp01(weight_total / (float)active_link_count) : 0.0f;
+    update_state_machine(motion_score, active_link_count);
 
-    clear_tick_samples(tick_id);
     s_last_finalized_tick_id = tick_id;
     s_has_finalized_tick = true;
 
     if (active_link_count == 0U) {
+        log_empty_fusion_if_due(reference_ms);
+        csi_fusion_canonical_event_t telemetry = {0};
+        telemetry.valid = true;
+        telemetry.schema_version = CSI_FUSION_SCHEMA_VERSION;
+        telemetry.tick_id = tick_id;
+        telemetry.fused_state = CSI_FUSION_STATE_IDLE;
+        telemetry.motion_score = 0.0f;
+        telemetry.confidence = 0.0f;
+        telemetry.timestamp_ms = timestamp_for_tick(tick_id);
+        telemetry.active_link_count = 0U;
+        trace_id_for_event(link_states, telemetry.trace_id, sizeof(telemetry.trace_id), tick_id);
+        if (out_fact != NULL) {
+            memset(out_fact, 0, sizeof(*out_fact));
+        }
+        if (out_telemetry != NULL) {
+            *out_telemetry = telemetry;
+        }
         return false;
     }
 
@@ -347,6 +573,7 @@ static bool finalize_tick(uint64_t tick_id,
     event.schema_version = CSI_FUSION_SCHEMA_VERSION;
     event.tick_id = tick_id;
     event.fused_state = s_state;
+    event.motion_score = motion_score;
     event.confidence = confidence;
     event.timestamp_ms = timestamp_for_tick(tick_id);
     event.active_link_count = active_link_count;
@@ -385,8 +612,20 @@ esp_err_t csi_fusion_update(const csi_fusion_feature_t *feature,
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    uint64_t sample_timestamp_ms = feature_timestamp_ms(feature);
-    uint64_t tick_id = feature->tick_id > 0ULL ? feature->tick_id : tick_id_for_timestamp(sample_timestamp_ms);
+    csi_fusion_link_t *link = &s_links[link_index];
+    if (!link->active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int device_link_index = link_index_for_device_id(feature->device_id);
+    if (device_link_index >= 0 && device_link_index != link_index) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    uint64_t tick_id = feature_tick_id(feature);
+    uint64_t sample_timestamp_ms = feature->timestamp_ms > 0ULL ?
+                                       feature->timestamp_ms :
+                                       timestamp_for_tick(tick_id);
     if (!s_has_current_tick) {
         s_current_tick_id = tick_id;
         s_has_current_tick = true;
@@ -396,27 +635,32 @@ esp_err_t csi_fusion_update(const csi_fusion_feature_t *feature,
         return ESP_OK;
     }
 
-    bool emitted = false;
     if (tick_id > s_current_tick_id) {
-        emitted = finalize_tick(s_current_tick_id, out_fact, out_telemetry);
+        (void)finalize_tick(s_current_tick_id, out_fact, out_telemetry);
         while (s_current_tick_id + 1ULL < tick_id) {
             ++s_current_tick_id;
             (void)finalize_tick(s_current_tick_id, NULL, NULL);
         }
         s_current_tick_id = tick_id;
-    } else if (tick_id + CSI_FUSION_STALE_TICKS < s_current_tick_id) {
-        return ESP_ERR_INVALID_ARG;
+    } else if (tick_id < s_current_tick_id) {
+        return ESP_OK;
     }
 
-    csi_fusion_link_t *link = &s_links[link_index];
-    link->pending_sample.valid = true;
-    link->pending_sample.feature = *feature;
-    link->pending_sample.feature.timestamp_ms = sample_timestamp_ms;
-    link->pending_sample.feature.tick_id = tick_id;
-
-    if (!emitted && tick_has_all_links(tick_id)) {
-        (void)finalize_tick(tick_id, out_fact, out_telemetry);
+    if (link->warmup_tick_count < CSI_FUSION_RESTORE_WARMUP_TICKS) {
+        if (link->warmup_tick_count == 0U || tick_id != link->last_warmup_tick_id) {
+            link->last_warmup_tick_id = tick_id;
+            ++link->warmup_tick_count;
+        }
+        if (link->warmup_tick_count < CSI_FUSION_RESTORE_WARMUP_TICKS) {
+            memset(&link->latest_sample, 0, sizeof(link->latest_sample));
+            return ESP_OK;
+        }
     }
+
+    link->latest_sample.valid = true;
+    link->latest_sample.feature = *feature;
+    link->latest_sample.feature.timestamp_ms = sample_timestamp_ms;
+    link->latest_sample.feature.tick_id = tick_id;
 
     return ESP_OK;
 }
@@ -433,7 +677,7 @@ esp_err_t csi_fusion_flush(csi_fusion_fact_t *out_fact,
         memset(out_telemetry, 0, sizeof(*out_telemetry));
     }
 
-    if (!s_has_current_tick) {
+    if (!any_link_active() || !s_has_current_tick) {
         return ESP_OK;
     }
 
@@ -492,9 +736,9 @@ esp_err_t csi_fusion_format_telemetry_json(const csi_fusion_telemetry_t *telemet
                            links_json,
                            state,
                            (double)telemetry->confidence,
+                           (double)telemetry->motion_score,
                            (double)telemetry->confidence,
-                           (double)telemetry->confidence,
-                           (double)telemetry->confidence,
+                           (double)telemetry->motion_score,
                            (unsigned long long)telemetry->timestamp_ms);
     return written > 0 && written < (int)out_size ? ESP_OK : ESP_ERR_INVALID_SIZE;
 }

@@ -1,10 +1,9 @@
 /**
  * @file csi_service.c
- * @brief C5 CSI runtime service.
+ * @brief C5 终端 CSI 运行服务。
  *
- * The runtime performs local calibration and feature extraction, then publishes
- * only low-dimensional feature frames to ESPS3. C5 does not decide IDLE/MOTION/HOLD
- * and never uploads raw CSI or subcarrier arrays.
+ * 本服务只在 C5 本地完成校准、低维 feature 提取和本地 IDLE/MOTION hint，
+ * 再把 feature frame 发给 ESPS3。C5 不上传 raw CSI、I/Q buffer 或子载波矩阵。
  */
 
 #include "csi_service.h"
@@ -15,7 +14,10 @@
 #include <string.h>
 
 #include "app_main_config.h"
+#include "c5_backpressure_controller.h"
+#include "c5_event_bus.h"
 #include "csi_capture.h"
+#include "csi_edge_detector.h"
 #include "csi_feature.h"
 #include "csi_server_client.h"
 #include "esp_timer.h"
@@ -23,14 +25,9 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
-#include "freertos/task.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "csi_service";
-
-#ifndef CSI_SERVICE_PROCESS_WAIT_MS
-#define CSI_SERVICE_PROCESS_WAIT_MS 50U
-#endif
 
 typedef struct {
     uint64_t timestamp_ms;
@@ -39,18 +36,38 @@ typedef struct {
     csi_iq_sample_t iq_samples[CSI_PHASE_A_MAX_RAW_SUBCARRIERS];
 } csi_pending_sample_t;
 
+typedef struct {
+    uint64_t timestamp_ms;
+    float motion_score;
+    float confidence;
+    float variance;
+    float cv;
+    float quality;
+    int rssi;
+    envelope_state_hint_t state_hint;
+    csi_feature_frame_t feature;
+    bool valid;
+} csi_latest_feature_slot_t;
+
 static bool s_csi_started;
 static bool s_csi_paused;
 static bool s_csi_initialized;
-static bool s_latest_feature_valid;
 static bool s_pending_sample_valid;
-static TaskHandle_t s_csi_task;
 static csi_feature_config_t s_feature_config;
 static csi_feature_processor_t s_processor;
-static csi_feature_frame_t s_latest_feature;
+static csi_edge_detector_t s_edge_detector;
 static csi_pending_sample_t s_pending_sample;
+static csi_latest_feature_slot_t s_latest_feature_slots[2];
 static uint32_t s_pending_sample_overwrites;
+static uint8_t s_latest_feature_read_index;
+static uint8_t s_latest_feature_write_index;
 static portMUX_TYPE s_feature_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static envelope_state_hint_t csi_service_edge_state_to_local_hint(csi_edge_state_t state)
+{
+    return state == CSI_EDGE_STATE_MOTION ? ENVELOPE_STATE_HINT_MOTION
+                                          : ENVELOPE_STATE_HINT_IDLE;
+}
 
 static bool csi_service_store_pending_sample(const wifi_csi_info_t *data)
 {
@@ -124,9 +141,28 @@ static void csi_service_process_frame(const csi_frame_sample_t *frame)
         strlcpy(feature.link_id,
                 csi_server_client_local_link_id(),
                 sizeof(feature.link_id));
+        csi_edge_detection_t edge_detection = {0};
+        if (csi_edge_detector_push(&s_edge_detector, &feature, &edge_detection)) {
+            feature.state_hint =
+                csi_service_edge_state_to_local_hint(edge_detection.local_state_hint);
+            feature.motion_score = edge_detection.motion_score;
+            feature.confidence = edge_detection.confidence;
+        }
+        uint8_t slot = (uint8_t)(s_latest_feature_write_index ^ 1U);
         portENTER_CRITICAL(&s_feature_lock);
-        s_latest_feature = feature;
-        s_latest_feature_valid = true;
+        s_latest_feature_slots[slot].timestamp_ms = feature.timestamp_ms;
+        s_latest_feature_slots[slot].motion_score = feature.motion_score;
+        s_latest_feature_slots[slot].confidence = feature.confidence;
+        s_latest_feature_slots[slot].variance = feature.metrics.variance;
+        s_latest_feature_slots[slot].cv = feature.metrics.cv;
+        s_latest_feature_slots[slot].quality = feature.metrics.quality;
+        s_latest_feature_slots[slot].rssi = feature.metrics.rssi;
+        s_latest_feature_slots[slot].state_hint = feature.state_hint;
+        s_latest_feature_slots[slot].feature = feature;
+        s_latest_feature_slots[slot].valid = true;
+        s_latest_feature_slots[s_latest_feature_read_index].valid = false;
+        s_latest_feature_read_index = slot;
+        s_latest_feature_write_index = slot;
         portEXIT_CRITICAL(&s_feature_lock);
     }
 }
@@ -134,12 +170,12 @@ static void csi_service_process_frame(const csi_frame_sample_t *frame)
 static void csi_service_rx_cb(void *ctx, wifi_csi_info_t *data)
 {
     (void)ctx;
-    if (!s_csi_started || s_csi_paused || data == NULL || s_csi_task == NULL) {
+    if (!s_csi_started || s_csi_paused || data == NULL) {
         return;
     }
 
     if (csi_service_store_pending_sample(data)) {
-        xTaskNotifyGive(s_csi_task);
+        (void)c5_event_bus_enqueue(C5_EVENT_CSI_READY, C5_EVENT_SOURCE_CALLBACK);
     }
 }
 
@@ -185,64 +221,71 @@ static esp_err_t csi_service_configure_wifi_csi(void)
     return ESP_OK;
 }
 
-static void csi_service_task(void *arg)
+esp_err_t csi_service_process_tick(void)
 {
-    (void)arg;
-    ESP_LOGI(TAG,
-             "CSI feature task started interval_ms=%u log=%d http=%d feature_version=%s",
-             (unsigned int)CSI_SERVICE_REPORT_INTERVAL_MS,
-             CSI_OUTPUT_ENABLE_LOG,
-             CSI_OUTPUT_ENABLE_HTTP,
-             CSI_ALGORITHM_VERSION);
-
-    TickType_t last_report_tick = xTaskGetTickCount();
-
-    while (1) {
-        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CSI_SERVICE_PROCESS_WAIT_MS));
-        if (!s_csi_started || s_csi_paused) {
-            continue;
-        }
-
-        csi_frame_sample_t frame = {0};
-        if (csi_service_take_pending_frame(&frame)) {
-            csi_service_process_frame(&frame);
-        }
-
-        TickType_t now_tick = xTaskGetTickCount();
-        if (now_tick - last_report_tick < pdMS_TO_TICKS(CSI_SERVICE_REPORT_INTERVAL_MS)) {
-            continue;
-        }
-        last_report_tick = now_tick;
-
-        csi_feature_frame_t feature = {0};
-        bool has_feature = false;
-        portENTER_CRITICAL(&s_feature_lock);
-        if (s_latest_feature_valid) {
-            feature = s_latest_feature;
-            s_latest_feature_valid = false;
-            has_feature = true;
-        }
-        portEXIT_CRITICAL(&s_feature_lock);
-
-        if (!has_feature) {
-            if (!csi_feature_processor_ready(&s_processor)) {
-                ESP_LOGD(TAG, "CSI calibration in progress");
-            }
-            continue;
-        }
-
-        esp_err_t ret = csi_server_client_publish_feature_result(&feature,
-                                                                 CSI_OUTPUT_ENABLE_LOG != 0,
-                                                                 CSI_OUTPUT_ENABLE_HTTP != 0);
-        (void)ret;
+    if (!c5_should_run(C5_TASK_TYPE_CSI_PROCESS)) {
+        return ESP_ERR_INVALID_STATE;
     }
+    if (!s_csi_started || s_csi_paused) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    csi_frame_sample_t frame = {0};
+    if (!csi_service_take_pending_frame(&frame)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    csi_service_process_frame(&frame);
+    return ESP_OK;
+}
+
+esp_err_t csi_service_report_tick(void)
+{
+    if (!c5_should_run(C5_TASK_TYPE_CSI_REPORT)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_csi_started || s_csi_paused) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    csi_feature_frame_t feature = {0};
+    bool has_feature = false;
+    portENTER_CRITICAL(&s_feature_lock);
+    csi_latest_feature_slot_t *slot = &s_latest_feature_slots[s_latest_feature_read_index];
+    if (slot->valid) {
+        feature = slot->feature;
+        slot->valid = false;
+        has_feature = true;
+    }
+    portEXIT_CRITICAL(&s_feature_lock);
+
+    if (!has_feature) {
+        if (!csi_feature_processor_ready(&s_processor)) {
+            ESP_LOGD(TAG, "CSI calibration in progress");
+        }
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    return csi_server_client_publish_feature_result(&feature,
+                                                    CSI_OUTPUT_ENABLE_LOG != 0,
+                                                    CSI_OUTPUT_ENABLE_HTTP != 0);
+}
+
+esp_err_t csi_service_tick(void)
+{
+    esp_err_t process_ret = csi_service_process_tick();
+    esp_err_t report_ret = csi_service_report_tick();
+    return report_ret != ESP_ERR_NOT_FOUND ? report_ret : process_ret;
 }
 
 esp_err_t csi_service_init(void)
 {
     csi_feature_default_config(&s_feature_config);
     csi_feature_processor_init(&s_processor, &s_feature_config);
-    s_latest_feature_valid = false;
+    csi_edge_detector_init(&s_edge_detector, NULL);
+    memset(s_latest_feature_slots, 0, sizeof(s_latest_feature_slots));
+    s_latest_feature_read_index = 0;
+    s_latest_feature_write_index = 0;
     s_pending_sample_valid = false;
     s_pending_sample_overwrites = 0;
     s_csi_initialized = true;
@@ -257,9 +300,10 @@ esp_err_t csi_service_init(void)
         return ret;
     }
     ESP_LOGI(TAG,
-             "CSI service initialized calibration_ms=%u ewma_alpha=%.2f feature_only=1 log=%d http=%d",
+             "CSI service initialized calibration_ms=%u ewma_alpha=%.2f edge_window=%u log=%d http=%d",
              (unsigned int)s_feature_config.calibration_duration_ms,
              (double)s_feature_config.ewma_alpha,
+             (unsigned int)CSI_EDGE_DETECTOR_DEFAULT_WINDOW_SIZE,
              CSI_OUTPUT_ENABLE_LOG,
              CSI_OUTPUT_ENABLE_HTTP);
     return ESP_OK;
@@ -281,8 +325,17 @@ esp_err_t csi_service_start(void)
         return ESP_OK;
     }
 
+    esp_err_t bus_ret = c5_event_bus_init();
+    if (bus_ret != ESP_OK) {
+        ESP_LOGW(TAG, "CSI event bus init failed: %s", esp_err_to_name(bus_ret));
+        return bus_ret;
+    }
+
     csi_feature_processor_init(&s_processor, &s_feature_config);
-    s_latest_feature_valid = false;
+    csi_edge_detector_init(&s_edge_detector, NULL);
+    memset(s_latest_feature_slots, 0, sizeof(s_latest_feature_slots));
+    s_latest_feature_read_index = 0;
+    s_latest_feature_write_index = 0;
     s_pending_sample_valid = false;
     s_pending_sample_overwrites = 0;
 
@@ -294,21 +347,12 @@ esp_err_t csi_service_start(void)
 
     s_csi_started = true;
     s_csi_paused = false;
-    if (s_csi_task == NULL) {
-        BaseType_t created = xTaskCreate(csi_service_task,
-                                         "csi_feature",
-                                         CSI_SERVICE_TASK_STACK,
-                                         NULL,
-                                         CSI_SERVICE_TASK_PRIORITY,
-                                         &s_csi_task);
-        if (created != pdPASS) {
-            s_csi_started = false;
-            s_csi_task = NULL;
-            (void)esp_wifi_set_csi(false);
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    ESP_LOGI(TAG, "CSI service started: calibration first, feature-only output");
+    ESP_LOGI(TAG,
+             "CSI service started: event-worker calibration first, edge-state output interval_ms=%u log=%d http=%d feature_version=%s",
+             (unsigned int)CSI_SERVICE_REPORT_INTERVAL_MS,
+             CSI_OUTPUT_ENABLE_LOG,
+             CSI_OUTPUT_ENABLE_HTTP,
+             CSI_ALGORITHM_VERSION);
     return ESP_OK;
 }
 

@@ -9,7 +9,8 @@
  *
  * 本模块不再在 C5 保存完整中文提示音，也不解析提示词文本。local_wake_word 在
  * WakeNet 命中后调用 wake_prompt_cache_play()，本模块短超时请求 S3
- * /local/v1/audio/wake-prompt 并边收边播；失败时返回错误给本地 short beep 兜底。
+ * /local/v1/audio/wake-prompt 写入临时 SPIFFS 文件，关闭 HTTP 后播放；失败时返回错误给
+ * 本地 short beep 兜底。
  */
 
 #ifndef WAKE_PROMPT_CACHE_CONNECT_TIMEOUT_MS
@@ -36,7 +37,7 @@
 #define WAKE_PROMPT_CACHE_HTTP_TX_BUFFER_BYTES 1024U // C5 metadata 请求 header 发送缓冲。
 #endif
 
-/** 调用方法：旧启动链路兼容入口；当前不下载、不写 SPIFFS，直接返回 ESP_OK。 */
+/** 调用方法：初始化 wake prompt 临时播放 spool；不预下载或持久缓存提示音。 */
 esp_err_t wake_prompt_cache_start_async(void);
 
 /** 调用方法：本地唤醒提示音播放阶段调用；成功播放 S3 PCM，失败返回原因给 short beep 回退。 */

@@ -32,6 +32,15 @@ void device_stream_gateway_stop(void);
 /** @brief 查询 stream gateway 是否处于运行状态。 */
 bool device_stream_gateway_is_running(void);
 
+/**
+ * @brief 清空 stream timestamp 单调检查基线。
+ *
+ * @param device_id 完整子设备 ID；NULL 或空字符串表示清空全部 baseline。
+ * @param reason 重置原因，用于串口验证日志。
+ */
+void device_stream_gateway_reset_timestamp_baseline(const char *device_id,
+                                                    const char *reason);
+
 /** @brief 解析并处理一帧 stream JSON；只由 scheduler stream worker 调用。 */
 esp_err_t device_stream_gateway_process_json(const char *json,
                                              size_t json_len,

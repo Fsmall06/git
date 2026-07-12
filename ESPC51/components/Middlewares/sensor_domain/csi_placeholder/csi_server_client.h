@@ -5,9 +5,9 @@
  * @file csi_server_client.h
  * @brief C5 CSI feature upload interface.
  *
- * This client only publishes low-dimensional feature frames to ESPS3
- * /local/v1/csi/result. It does not upload raw CSI, I/Q, phase, selected
- * subcarriers, or C5-side state decisions.
+ * This client only publishes low-dimensional feature frames and local edge
+ * state to ESPS3 /local/v1/csi/result. It does not upload raw CSI, I/Q, phase,
+ * selected subcarriers, or fused multi-link decisions.
  */
 
 #include <stdbool.h>

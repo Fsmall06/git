@@ -1,14 +1,22 @@
 'use strict';
 
 const NODE_IDS = ['C51', 'C52', 'S3'];
-const LINK_DEFINITIONS = [
-  { link_id: 'S3_TO_C51', source: 'S3', target: 'C51' },
-  { link_id: 'S3_TO_C52', source: 'S3', target: 'C52' },
-  { link_id: 'C51_TO_C52', source: 'C51', target: 'C52' },
-  { link_id: 'C52_TO_C51', source: 'C52', target: 'C51' },
+const ACTIVE_LINK_DEFINITIONS = [
+  { link_id: 'S3_TO_C51', source: 'S3', target: 'C51', link_kind: 'active' },
+  { link_id: 'S3_TO_C52', source: 'S3', target: 'C52', link_kind: 'active' },
 ];
-const LINK_IDS = LINK_DEFINITIONS.map((link) => link.link_id);
-const LINK_BY_ID = Object.fromEntries(LINK_DEFINITIONS.map((link) => [link.link_id, link]));
+const LEGACY_LINK_DEFINITIONS = [
+  { link_id: 'C51_TO_C52', source: 'C51', target: 'C52', link_kind: 'legacy' },
+  { link_id: 'C52_TO_C51', source: 'C52', target: 'C51', link_kind: 'legacy' },
+];
+const LINK_DEFINITIONS = ACTIVE_LINK_DEFINITIONS;
+const ACTIVE_LINK_IDS = ACTIVE_LINK_DEFINITIONS.map((link) => link.link_id);
+const LINK_IDS = ACTIVE_LINK_IDS;
+const LEGACY_LINK_IDS = LEGACY_LINK_DEFINITIONS.map((link) => link.link_id);
+const ALL_LINK_DEFINITIONS = [...ACTIVE_LINK_DEFINITIONS, ...LEGACY_LINK_DEFINITIONS];
+const ALL_LINK_IDS = [...LINK_IDS, ...LEGACY_LINK_IDS];
+const LINK_BY_ID = Object.fromEntries(ALL_LINK_DEFINITIONS.map((link) => [link.link_id, link]));
+const ACTIVE_LINK_BY_ID = Object.fromEntries(ACTIVE_LINK_DEFINITIONS.map((link) => [link.link_id, link]));
 
 const DEFAULT_ALIGNMENT_WINDOW_MS = 400;
 const MIN_ALIGNMENT_WINDOW_MS = 200;
@@ -22,6 +30,8 @@ const DEFAULT_NODE_GEOMETRY = {
   C52: { x: 0.18, y: 0.78 },
   S3: { x: 0.82, y: 0.78 },
 };
+
+const MOTION_STATE_LOG_SOURCES = new Set(['CSI_RESULT_V2', 'CSI_RX', 'CSI_LATEST']);
 
 function clamp(value, min, max) {
   const number = Number(value);
@@ -68,6 +78,9 @@ function normalizeState(value) {
   if (state === 'IDLE' || state === 'VACANT' || state === 'EMPTY') {
     return 'IDLE';
   }
+  if (state === 'UNKNOWN' || state === 'UNSET' || state === 'UNAVAILABLE' || state === 'NA' || state === '-') {
+    return 'UNKNOWN';
+  }
   return '';
 }
 
@@ -93,6 +106,9 @@ function normalizeSchemaVersion(sample) {
   if (isS3FusionShape(sample)) {
     return 's3-csi-fusion-v1';
   }
+  if (isMotionStateLinkShape(sample)) {
+    return 'motion-state-link-v1';
+  }
   if (sample.payload && sample.payload_type) {
     return 'canonical-csi-fact-v1';
   }
@@ -115,7 +131,7 @@ function normalizeLinkId(...values) {
     .map(normalizeToken);
 
   for (const token of tokens) {
-    for (const linkId of LINK_IDS) {
+    for (const linkId of ALL_LINK_IDS) {
       if (token === linkId || token.includes(linkId)) {
         return linkId;
       }
@@ -123,6 +139,12 @@ function normalizeLinkId(...values) {
   }
 
   const text = tokens.join(' ');
+  if (/\bC51_TO_C52\b/.test(text)) {
+    return 'C51_TO_C52';
+  }
+  if (/\bC52_TO_C51\b/.test(text)) {
+    return 'C52_TO_C51';
+  }
   if (/\bC51\b|ESPC51|SENSAIR_C51/.test(text)) {
     return 'S3_TO_C51';
   }
@@ -130,6 +152,18 @@ function normalizeLinkId(...values) {
     return 'S3_TO_C52';
   }
   return '';
+}
+
+function isActiveLinkId(linkId) {
+  return Boolean(ACTIVE_LINK_BY_ID[linkId]);
+}
+
+function isLegacyLinkId(linkId) {
+  return Boolean(LINK_BY_ID[linkId]) && !isActiveLinkId(linkId);
+}
+
+function isKnownLinkId(linkId) {
+  return Boolean(LINK_BY_ID[linkId]);
 }
 
 function timestampFrom(sample, fallback = null) {
@@ -173,6 +207,15 @@ function isS3FusionShape(sample) {
     (sample.fused_state !== undefined && (sample.links !== undefined || sample.confidence !== undefined));
 }
 
+function isMotionStateLinkShape(sample) {
+  const sourceFormat = String(sample.source_format || '').trim().toUpperCase();
+  const schemaVersion = String(sample.schema_version || sample.schemaVersion || sample.schema || '').trim().toLowerCase();
+  if (MOTION_STATE_LOG_SOURCES.has(sourceFormat) || schemaVersion === 'motion-state-link-v1') {
+    return true;
+  }
+  return false;
+}
+
 function detectSchema(sample) {
   if (isS3FusionShape(sample)) {
     return 's3_csi_fusion';
@@ -188,12 +231,25 @@ function detectSchema(sample) {
       sample.motion_score_local !== undefined || sample.state_hint !== undefined) {
     return 'c5_feature';
   }
+  if (isMotionStateLinkShape(sample)) {
+    return 'motion_state_link';
+  }
   return 'legacy_csi_fact';
 }
 
 function compactLinkEvent(input) {
-  const linkId = normalizeLinkId(input.link_id, input.linkId, input.role, input.device_id, input.source, input.target);
-  if (!LINK_BY_ID[linkId]) {
+  const linkId = normalizeLinkId(
+    input.link_id,
+    input.linkId,
+    input.lid,
+    input.did,
+    input.role,
+    input.device_id,
+    input.device,
+    input.source,
+    input.target,
+  );
+  if (!isKnownLinkId(linkId)) {
     return null;
   }
   const link = LINK_BY_ID[linkId];
@@ -220,6 +276,9 @@ function compactLinkEvent(input) {
     link_id: linkId,
     source: link.source,
     target: link.target,
+    link_kind: link.link_kind || (isActiveLinkId(linkId) ? 'active' : 'legacy'),
+    supported: isActiveLinkId(linkId),
+    disabled: !isActiveLinkId(linkId),
     motion_score: motionScore !== null ? clamp01(motionScore) : null,
     energy: firstFinite(input.energy, input.frame_energy, input.amplitude),
     variance: firstFinite(input.variance, input.amplitude_variance),
@@ -229,6 +288,12 @@ function compactLinkEvent(input) {
     confidence: input.confidence !== undefined && input.confidence !== null ? clamp01(input.confidence) : null,
     tick_id: input.tick_id !== null && input.tick_id !== undefined ? Math.round(Number(input.tick_id)) : null,
     frame_seq: input.frame_seq !== undefined && input.frame_seq !== null ? Math.round(Number(input.frame_seq)) : null,
+    bytes: firstFinite(input.bytes),
+    cv: firstFinite(input.cv),
+    sample_count: firstFinite(input.sample_count),
+    updated_at_ms: firstFinite(input.updated_at_ms),
+    child_timestamp_ms: firstFinite(input.child_timestamp_ms, input.child_ts),
+    age_ms: firstFinite(input.age_ms),
     observed_at_ms: observedAtMs,
     schema_version: input.schema_version,
     schema_path: input.schema_path,
@@ -238,6 +303,49 @@ function compactLinkEvent(input) {
     synthetic: Boolean(input.synthetic),
     valid: input.valid !== false,
   };
+}
+
+function parseMotionStateLink(sample, sourceFormat) {
+  const timestampMs = timestampFrom(sample);
+  const observedAtMs = observedAtFrom(sample, timestampMs);
+  const state = normalizeState(sample.state ?? sample.motion_state ?? sample.state_hint);
+  const linkId = normalizeLinkId(sample.link_id, sample.lid, sample.did, sample.device_id, sample.role, sample.source, sample.target);
+  const motionScore = firstFinite(
+    sample.motion_score,
+    sample.motion_score_local,
+    sample.confidence,
+    motionScoreForState(state),
+    sample.quality,
+  );
+  const confidence = firstFinite(sample.confidence, sample.quality, sample.motion_score);
+
+  const event = compactLinkEvent({
+    schema_version: normalizeSchemaVersion(sample),
+    schema_path: 'motion_state_link',
+    device_id: sample.device_id || sample.device || sample.did || sample.id || '',
+    link_id: linkId,
+    trace_id: sample.trace_id,
+    tick_id: sample.tick_id,
+    timestamp_ms: timestampMs,
+    observed_at_ms: observedAtMs,
+    motion_score: motionScore,
+    energy: firstFinite(sample.energy, sample.frame_energy),
+    variance: firstFinite(sample.variance, sample.amplitude_variance),
+    quality: confidence,
+    rssi: firstFinite(sample.rssi),
+    confidence,
+    state,
+    bytes: sample.bytes,
+    cv: sample.cv,
+    sample_count: sample.sample_count,
+    updated_at_ms: sample.updated_at_ms,
+    child_timestamp_ms: sample.child_timestamp_ms,
+    child_ts: sample.child_ts,
+    age_ms: sample.age_ms,
+    source_format: sourceFormat || sample.source_format,
+  });
+
+  return { events: event ? [event] : [], fusionEvents: [] };
 }
 
 function compactFusionEvent(input) {
@@ -464,6 +572,8 @@ function parseTelemetrySample(rawSample, options = {}) {
 
   if (schemaPath === 's3_csi_fusion') {
     parsed = parseS3FusionTelemetry(sample, sourceFormat);
+  } else if (schemaPath === 'motion_state_link') {
+    parsed = parseMotionStateLink(sample, sourceFormat);
   } else if (schemaPath === 'canonical_csi_fact') {
     parsed = parseCanonicalOrLegacy(sample, asObject(sample.payload) || {}, 'canonical_csi_fact', sourceFormat);
   } else if (schemaPath === 'c5_feature') {
@@ -651,7 +761,7 @@ function decorateLinkEvent(event, frame, referenceObservedAtMs) {
   if (!event) {
     return null;
   }
-  const ageMs = ageForEvent(event, frame, referenceObservedAtMs);
+  const ageMs = Number.isFinite(event.age_ms) ? Math.max(0, Number(event.age_ms)) : ageForEvent(event, frame, referenceObservedAtMs);
   const decayMs = DEFAULT_DECAY_MS;
   const freshness = ageMs === null ? 1 : clamp01(Math.exp(-ageMs / decayMs));
   const quality = clamp01(event.quality ?? event.confidence ?? 0.5);
@@ -709,7 +819,7 @@ function alignTelemetryEvents(rawEvents, options = {}) {
     const observedAtMs = Math.round(median(activeLinks.map((linkId) => links[linkId].observed_at_ms).filter(Number.isFinite)) ??
       fusionEvent?.observed_at_ms ?? anchor.observed_at_ms ?? 0) || null;
     const frame = {
-      frame_type: 'aligned_frame',
+      frame_type: 'motion_state_frame',
       alignment_key: anchor.key,
       alignment_basis: anchor.basis,
       tick_id: anchor.tick_id,
@@ -749,6 +859,9 @@ function frameMetrics(frame, bounds) {
 }
 
 function nextStateForScore(currentState, score, thresholds) {
+  if (!Number.isFinite(score)) {
+    return 'UNKNOWN';
+  }
   if (currentState === 'MOTION') {
     return score <= thresholds.motionExit ? 'HOLD' : 'MOTION';
   }
@@ -758,7 +871,16 @@ function nextStateForScore(currentState, score, thresholds) {
     }
     return score <= thresholds.idleEnter ? 'IDLE' : 'HOLD';
   }
-  return score >= thresholds.motionEnter ? 'MOTION' : 'IDLE';
+  if (currentState === 'IDLE' || currentState === 'UNKNOWN' || currentState === '') {
+    if (score >= thresholds.motionEnter) {
+      return 'MOTION';
+    }
+    if (score <= thresholds.idleEnter) {
+      return 'IDLE';
+    }
+    return 'HOLD';
+  }
+  return score >= thresholds.motionEnter ? 'MOTION' : score <= thresholds.idleEnter ? 'IDLE' : 'HOLD';
 }
 
 function buildStateTimeline(frames, options = {}) {
@@ -773,7 +895,7 @@ function buildStateTimeline(frames, options = {}) {
     variance: metricBounds(frames, 'variance'),
   };
 
-  let state = 'IDLE';
+  let state = 'UNKNOWN';
   let stateSinceMs = null;
   let pendingState = '';
   let pendingSinceMs = null;
@@ -784,7 +906,7 @@ function buildStateTimeline(frames, options = {}) {
     let candidateState = frame.fusion.state || nextStateForScore(state, metrics.composite_score, thresholds);
 
     if (index === 0) {
-      state = candidateState || 'IDLE';
+      state = candidateState || 'UNKNOWN';
       stateSinceMs = timestampMs;
       pendingState = '';
       pendingSinceMs = null;
@@ -831,167 +953,147 @@ function buildStateTimeline(frames, options = {}) {
   });
 }
 
-function midpoint(a, b) {
-  return {
-    x: Number(((a.x + b.x) / 2).toFixed(4)),
-    y: Number(((a.y + b.y) / 2).toFixed(4)),
-  };
+function entryRecencyMs(entry) {
+  return firstFinite(
+    entry?.updated_at_ms,
+    entry?.observed_at_ms,
+    entry?.timestamp_ms,
+    entry?.timestamp,
+    entry?.received_at_ms,
+    entry?.server_time_ms,
+  );
 }
 
-function buildTopologyFrame(frame) {
-  const nodes = NODE_IDS.map((nodeId) => ({
-    node_id: nodeId,
-    ...(DEFAULT_NODE_GEOMETRY[nodeId] || { x: 0, y: 0 }),
-  }));
-  const edges = LINK_DEFINITIONS.map((link) => {
-    const event = frame?.links?.[link.link_id] || null;
-    return {
-      ...link,
-      state: event?.state || frame?.fusion?.state || '',
-      motion_score: event?.motion_score ?? null,
-      energy: event?.energy ?? null,
-      variance: event?.variance ?? null,
-      quality: event?.quality ?? null,
-      rssi: event?.rssi ?? null,
-      age_ms: event?.age_ms ?? null,
-      health: event?.health ?? 0,
-      visual_strength: event?.visual_strength ?? 0,
-      healthy: Boolean(event?.healthy),
-      synthetic: Boolean(event?.synthetic),
-      timestamp: event?.timestamp ?? null,
-    };
-  });
-  return { nodes, edges };
-}
-
-function buildRadarFrame(frame) {
-  if (!frame) {
-    return null;
+function compareRecencyDesc(a, b) {
+  const aMs = entryRecencyMs(a);
+  const bMs = entryRecencyMs(b);
+  if (aMs !== bMs) {
+    return (bMs ?? -Infinity) - (aMs ?? -Infinity);
   }
-  const heat = LINK_DEFINITIONS.map((link) => {
-    const source = DEFAULT_NODE_GEOMETRY[link.source];
-    const target = DEFAULT_NODE_GEOMETRY[link.target];
-    const point = midpoint(source, target);
-    const event = frame.links[link.link_id];
-    return {
-      link_id: link.link_id,
-      source: link.source,
-      target: link.target,
-      x: point.x,
-      y: point.y,
-      motion_intensity: clamp01(event?.motion_score ?? 0),
-      confidence: clamp01(event?.quality ?? event?.confidence ?? 0),
-      activity_heat: clamp01(event?.visual_strength ?? 0),
-      health: clamp01(event?.health ?? 0),
-      age_ms: event?.age_ms ?? null,
-    };
-  });
-
-  return {
-    frame_type: 'radar_frame',
-    center: 'S3',
-    timestamp: frame.timestamp,
-    timestamp_ms: frame.timestamp_ms,
-    tick_id: frame.tick_id,
-    fused_state: frame.fusion,
-    motion_intensity: frame.fusion.motion_score,
-    confidence: frame.fusion.confidence,
-    activity_heat: heat,
-    max_intensity: heat.length ? Math.max(...heat.map((point) => point.motion_intensity)) : 0,
-  };
-}
-
-function valueAt(frame, field, linkId) {
-  if (field === 'health') {
-    return frame.links[linkId]?.health ?? null;
+  const aTick = firstFinite(a?.tick_id);
+  const bTick = firstFinite(b?.tick_id);
+  if (aTick !== bTick) {
+    return (bTick ?? -Infinity) - (aTick ?? -Infinity);
   }
-  if (field === 'quality') {
-    return frame.links[linkId]?.quality ?? null;
-  }
-  return frame.links[linkId]?.[field] ?? null;
+  return String(b?.source_format || '').localeCompare(String(a?.source_format || ''));
 }
 
-function buildSeries(frames) {
-  const build = (field) => frames.map((frame) => {
-    const row = {
-      timestamp: frame.timestamp,
-      timestamp_ms: frame.timestamp_ms,
-      tick_id: frame.tick_id,
-      fused: field === 'motion_score' ? frame.fusion.motion_score : null,
-    };
-    for (const linkId of LINK_IDS) {
-      row[linkId] = valueAt(frame, field, linkId);
-    }
-    return row;
-  });
+function summarizeRawSample(sample) {
+  const fusedState = asObject(sample.fused_state) || {};
+  const state = normalizeState(sample.state ?? sample.motion_state ?? sample.state_hint ?? fusedState.state);
+  const motionScore = firstFinite(
+    sample.motion_score,
+    sample.motion_score_local,
+    sample.confidence,
+    sample.quality,
+    fusedState.motion_score,
+    fusedState.confidence,
+    motionScoreForState(state),
+  );
+  const confidence = firstFinite(sample.confidence, sample.quality, fusedState.confidence, sample.motion_score);
+  const linkId = normalizeLinkId(sample.link_id, sample.device_id, sample.source, sample.target);
+  const timestampMs = timestampFrom(sample);
+  const observedAtMs = observedAtFrom(sample, timestampMs);
+  const updatedAtMs = firstFinite(sample.updated_at_ms, timestampMs, observedAtMs);
 
   return {
-    motion_score: build('motion_score'),
-    energy: build('energy'),
-    quality: build('quality'),
-    link_health: build('health'),
+    timestamp_ms: timestampMs,
+    observed_at_ms: observedAtMs,
+    updated_at_ms: updatedAtMs,
+    link_id: linkId || '',
+    source_format: sample.source_format || '',
+    device_id: sample.device_id || '',
+    trace_id: sample.trace_id || '',
+    tick_id: sample.tick_id !== undefined && sample.tick_id !== null ? Math.round(Number(sample.tick_id)) : null,
+    state: state || 'UNKNOWN',
+    motion_state: state || 'UNKNOWN',
+    motion_score: motionScore !== null ? clamp01(motionScore) : null,
+    confidence: confidence !== null ? clamp01(confidence) : null,
+    quality: firstFinite(sample.quality, sample.metrics && sample.metrics.quality),
+    rssi: firstFinite(sample.rssi, sample.metrics && sample.metrics.rssi),
+    energy: firstFinite(sample.energy, sample.frame_energy, sample.metrics && sample.metrics.frame_energy),
+    variance: firstFinite(sample.variance, sample.amplitude_variance, sample.metrics && sample.metrics.variance),
+    cv: firstFinite(sample.cv, sample.metrics && sample.metrics.cv),
+    bytes: firstFinite(sample.bytes),
+    sample_count: firstFinite(sample.sample_count),
+    age_ms: firstFinite(sample.age_ms),
+    raw_line: sample.raw_line || '',
+    telemetry_schema: sample.telemetry_schema || '',
+    telemetry_schema_path: sample.telemetry_schema_path || '',
+    event_count: Array.isArray(sample.telemetry_events) ? sample.telemetry_events.length : 0,
+    fusion_event_count: Array.isArray(sample.telemetry_fusion_events) ? sample.telemetry_fusion_events.length : 0,
+    supported: isActiveLinkId(linkId),
+    disabled: isLegacyLinkId(linkId),
   };
 }
 
-function buildConfidenceEnvelope(frames) {
-  return frames.map((frame) => {
-    const scores = LINK_IDS.map((linkId) => frame.links[linkId]?.motion_score)
-      .filter((value) => Number.isFinite(value));
-    const score = frame.fusion.motion_score ?? average(scores) ?? 0;
-    const stability = clamp01(1 - stddev(scores));
-    const confidence = clamp01(frame.fusion.confidence ?? stability);
-    const spread = clamp01(((1 - stability) * 0.5) + ((1 - confidence) * 0.25));
+function buildLinkCard(linkId, event, generatedAtMs) {
+  const link = LINK_BY_ID[linkId] || {};
+  const active = isActiveLinkId(linkId);
+  if (!event) {
     return {
-      timestamp: frame.timestamp,
-      timestamp_ms: frame.timestamp_ms,
-      tick_id: frame.tick_id,
-      score: clamp01(score),
-      confidence,
-      stability,
-      lower: clamp01(score - spread),
-      upper: clamp01(score + spread),
+      link_id: linkId,
+      source: link.source || '',
+      target: link.target || '',
+      link_kind: active ? 'active' : 'legacy',
+      supported: active,
+      disabled: !active,
+      status: active ? 'waiting' : 'not_implemented',
+      state: 'UNKNOWN',
+      motion_score: null,
+      confidence: null,
+      quality: null,
+      rssi: null,
+      age_ms: null,
+      freshness: 0,
+      healthy: false,
+      last_update_ms: null,
+      last_update_iso: '',
+      sample_count: null,
+      bytes: null,
+      cv: null,
+      source_format: '',
+      raw_line: '',
     };
-  });
-}
+  }
 
-function buildMotionHeatSeries(frames, stateTimeline) {
-  return frames.map((frame, index) => {
-    const row = {
-      timestamp: frame.timestamp,
-      timestamp_ms: frame.timestamp_ms,
-      tick_id: frame.tick_id,
-      state: stateTimeline[index]?.state || frame.fusion.state || '',
-      fused: frame.fusion.motion_score,
-      confidence: frame.fusion.confidence,
-    };
-    for (const linkId of LINK_IDS) {
-      row[linkId] = frame.links[linkId]?.motion_score ?? null;
-    }
-    return row;
-  });
-}
+  const decorated = decorateLinkEvent(event, { timestamp_ms: generatedAtMs }, generatedAtMs) || event;
+  const lastUpdateMs = firstFinite(decorated.updated_at_ms, decorated.observed_at_ms, decorated.timestamp_ms);
+  const status = active
+    ? (decorated.healthy ? 'healthy' : decorated.age_ms !== null && decorated.age_ms > LINK_HEALTH_STALE_MS ? 'stale' : 'watching')
+    : 'not_implemented';
 
-function buildFusionStatus(latestFrame, stateTimeline) {
-  const latestState = stateTimeline[stateTimeline.length - 1];
-  const topology = buildTopologyFrame(latestFrame);
-  const healthyLinkCount = topology.edges.filter((edge) => edge.healthy).length;
-  const motionIntensity = latestFrame?.fusion?.motion_score ?? 0;
-  const confidence = latestFrame?.fusion?.confidence ?? 0;
   return {
-    title: 'CSI Fusion Status',
-    nodes: NODE_IDS,
-    links_healthy: healthyLinkCount,
-    links_total: LINK_IDS.length,
-    current_state: latestState?.state || latestFrame?.fusion?.state || 'IDLE',
-    confidence: clamp01(confidence),
-    confidence_percent: Math.round(clamp01(confidence) * 100),
-    motion_intensity: clamp01(motionIntensity),
-    latest_timestamp: latestFrame?.timestamp ?? null,
-    latest_tick_id: latestFrame?.tick_id ?? null,
+    ...decorated,
+    link_id: linkId,
+    source: link.source || decorated.source || '',
+    target: link.target || decorated.target || '',
+    link_kind: active ? 'active' : 'legacy',
+    supported: active,
+    disabled: !active,
+    status,
+    state: decorated.state || 'UNKNOWN',
+    last_update_ms: lastUpdateMs,
+    last_update_iso: lastUpdateMs ? new Date(lastUpdateMs).toISOString() : '',
   };
 }
 
-function buildTelemetryUiModel(samples, options = {}) {
+function buildRecentResultFeatures(rawSamples, limit = 8) {
+  return rawSamples
+    .filter((sample) => String(sample.source_format || '').toUpperCase() === 'CSI_RESULT_V2')
+    .slice(-limit)
+    .reverse()
+    .map((sample) => summarizeRawSample(sample));
+}
+
+function buildLatestLogs(rawSamples, limit = 10) {
+  return rawSamples
+    .slice(-limit)
+    .reverse()
+    .map((sample) => summarizeRawSample(sample));
+}
+
+function buildMotionStateModel(samples, options = {}) {
   const generatedAtMs = Number(options.generatedAtMs ?? Date.now());
   const parsedSamples = samples.map((sample) => parseTelemetrySample(sample));
   const schemaCounts = {};
@@ -1004,7 +1106,10 @@ function buildTelemetryUiModel(samples, options = {}) {
     fusionEvents.push(...parsed.fusion_events);
   }
 
-  const alignedFrames = alignTelemetryEvents(events, {
+  const rawSamples = samples.map((sample) => summarizeRawSample(sample));
+  const activeEvents = events.filter((event) => isActiveLinkId(event.link_id));
+  const legacyEvents = events.filter((event) => isLegacyLinkId(event.link_id));
+  const alignedFrames = alignTelemetryEvents(activeEvents, {
     ...options,
     fusionEvents,
     generatedAtMs,
@@ -1012,7 +1117,58 @@ function buildTelemetryUiModel(samples, options = {}) {
   });
   const stateTimeline = buildStateTimeline(alignedFrames, options);
   const latestFrame = alignedFrames[alignedFrames.length - 1] || null;
-  const topology = buildTopologyFrame(latestFrame);
+  const latestState = stateTimeline[stateTimeline.length - 1] || null;
+  const latestFrameMotion = latestFrame?.fusion?.motion_score ?? null;
+  const latestFrameConfidence = latestFrame?.fusion?.confidence ?? null;
+  const activeEventsByLink = new Map();
+  const legacyEventsByLink = new Map();
+
+  for (const event of activeEvents) {
+    const current = activeEventsByLink.get(event.link_id);
+    if (!current || compareRecencyDesc(event, current) < 0) {
+      activeEventsByLink.set(event.link_id, event);
+    }
+  }
+  for (const event of legacyEvents) {
+    const current = legacyEventsByLink.get(event.link_id);
+    if (!current || compareRecencyDesc(event, current) < 0) {
+      legacyEventsByLink.set(event.link_id, event);
+    }
+  }
+
+  const activeLinkCards = ACTIVE_LINK_IDS.map((linkId) => buildLinkCard(linkId, activeEventsByLink.get(linkId) || null, generatedAtMs));
+  const legacyLinkCards = LEGACY_LINK_IDS
+    .filter((linkId) => legacyEventsByLink.has(linkId))
+    .map((linkId) => buildLinkCard(linkId, legacyEventsByLink.get(linkId), generatedAtMs));
+  const recentResultFeatures = buildRecentResultFeatures(rawSamples);
+  const latestLogs = buildLatestLogs(rawSamples, 12);
+  const lastUpdateMs = rawSamples.reduce((max, sample) => Math.max(max, entryRecencyMs(sample) || 0), 0) || null;
+  const motionScore = latestFrameMotion !== null && latestFrameMotion !== undefined
+    ? latestFrameMotion
+    : average(activeLinkCards.map((card) => card.motion_score).filter((value) => Number.isFinite(value)));
+  const confidence = latestFrameConfidence !== null && latestFrameConfidence !== undefined
+    ? latestFrameConfidence
+    : average(activeLinkCards.map((card) => card.confidence).filter((value) => Number.isFinite(value)));
+
+  const motionStateModel = {
+    current_state: latestState?.state || latestFrame?.fusion?.state || 'UNKNOWN',
+    motion_score: motionScore !== null ? clamp01(motionScore) : null,
+    confidence: confidence !== null ? clamp01(confidence) : null,
+    active_links: activeLinkCards,
+    legacy_links: legacyLinkCards,
+    active_link_ids: activeLinkCards.map((card) => card.link_id),
+    legacy_link_ids: legacyLinkCards.map((card) => card.link_id),
+    last_update_ms: lastUpdateMs,
+    last_update_iso: lastUpdateMs ? new Date(lastUpdateMs).toISOString() : '',
+    latest_tick_id: latestFrame?.tick_id ?? null,
+    latest_trace_id: latestFrame?.fusion?.trace_id || '',
+    state_timeline: stateTimeline,
+    recent_result_v2_features: recentResultFeatures,
+    latest_logs: latestLogs,
+    raw_parsed_events: rawSamples,
+    link_cache: Object.fromEntries(activeLinkCards.map((card) => [card.link_id, card])),
+    legacy_link_cache: Object.fromEntries(legacyLinkCards.map((card) => [card.link_id, card])),
+  };
 
   return {
     ok: true,
@@ -1022,42 +1178,48 @@ function buildTelemetryUiModel(samples, options = {}) {
       event_count: events.length,
       fusion_event_count: fusionEvents.length,
       schema_counts: schemaCounts,
+      active_event_count: activeEvents.length,
+      legacy_event_count: legacyEvents.length,
+      result_v2_count: recentResultFeatures.length,
     },
     data_model: {
-      fields: ['timestamp', 'link_id', 'source', 'target', 'motion_score', 'energy', 'variance', 'quality', 'rssi', 'state'],
-      link_ids: LINK_IDS,
-      nodes: NODE_IDS,
+      fields: ['timestamp_ms', 'link_id', 'state', 'motion_score', 'confidence', 'quality', 'rssi', 'age_ms'],
+      active_link_ids: ACTIVE_LINK_IDS,
+      legacy_link_ids: LEGACY_LINK_IDS,
     },
-    fusion_status: buildFusionStatus(latestFrame, stateTimeline),
-    alignment: {
-      window_ms: normalizeWindowMs(options.windowMs),
-      link_ids: LINK_IDS,
+    motion_state_model: motionStateModel,
+    fusion_status: {
+      current_state: motionStateModel.current_state,
+      motion_score: motionStateModel.motion_score,
+      confidence: motionStateModel.confidence,
+      active_links: motionStateModel.active_link_ids,
+      active_link_count: motionStateModel.active_link_ids.length,
+      active_link_healthy_count: activeLinkCards.filter((card) => card.healthy).length,
+      last_update_ms: motionStateModel.last_update_ms,
+      last_update_iso: motionStateModel.last_update_iso,
+      latest_tick_id: motionStateModel.latest_tick_id,
     },
-    topology,
-    radar_frame: buildRadarFrame(latestFrame),
-    series: buildSeries(alignedFrames),
-    motion_heat_series: buildMotionHeatSeries(alignedFrames, stateTimeline),
-    confidence_envelope: buildConfidenceEnvelope(alignedFrames),
-    aligned_csi_timeline: alignedFrames,
-    state_timeline: stateTimeline,
     telemetry_events: events,
     fusion_events: fusionEvents,
   };
+}
+
+function buildTelemetryUiModel(samples, options = {}) {
+  return buildMotionStateModel(samples, options);
 }
 
 module.exports = {
   DEFAULT_ALIGNMENT_WINDOW_MS,
   LINK_DEFINITIONS,
   LINK_IDS,
+  LEGACY_LINK_IDS,
   NODE_IDS,
   annotateSampleWithTelemetry,
   alignTelemetryEvents,
-  buildConfidenceEnvelope,
-  buildMotionHeatSeries,
-  buildRadarFrame,
   buildStateTimeline,
   buildTelemetryUiModel,
   detectSchema,
+  buildMotionStateModel,
   normalizeLinkId,
   normalizeWindowMs,
   parseTelemetrySample,

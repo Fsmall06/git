@@ -179,7 +179,11 @@ extern "C" {
 #define ESP111_PROTOCOL_SERVER_ROUTE_COMMANDS_PREFIX "/api/commands/"
 #define ESP111_PROTOCOL_SERVER_ROUTE_COMMAND_ACK_SUFFIX "/ack"
 #define ESP111_PROTOCOL_SERVER_DEFAULT_TIMEOUT_MS 8000
+/* Kept for source compatibility with firmware that still uses the old per-phase budget. */
 #define ESP111_PROTOCOL_SERVER_VOICE_TIMEOUT_MS 30000
+#ifndef VOICE_REQUEST_TIMEOUT_MS
+#define VOICE_REQUEST_TIMEOUT_MS 60000U
+#endif
 
 /* 语音边界：C5 上传/接收 PCM，S3 只代理，ASR/LLM/TTS 具体实现位于 Server 侧。 */
 #define ESP111_PROTOCOL_AUDIO_CONTENT_TYPE_L16_16K_MONO \

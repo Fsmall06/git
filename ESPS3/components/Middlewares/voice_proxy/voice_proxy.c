@@ -31,7 +31,7 @@ static const char *TAG = "voice_proxy";
 
 enum {
     VOICE_PROXY_LOCAL_SOCKET_TIMEOUT_SEC =
-        (ESP111_PROTOCOL_SERVER_VOICE_TIMEOUT_MS + 999) / 1000 + 5,
+        (VOICE_REQUEST_TIMEOUT_MS + 999) / 1000,
 };
 
 static SemaphoreHandle_t s_voice_lock;
@@ -332,7 +332,7 @@ esp_err_t voice_proxy_handle_turn(httpd_req_t *req)
              device_id,
              (unsigned int)pcm_len,
              ESP111_PROTOCOL_SERVER_ROUTE_VOICE_TURN,
-             (unsigned int)ESP111_PROTOCOL_SERVER_VOICE_TIMEOUT_MS);
+             (unsigned int)VOICE_REQUEST_TIMEOUT_MS);
     ret = server_client_post_voice_turn(device_id,
                                         pcm,
                                         pcm_len,

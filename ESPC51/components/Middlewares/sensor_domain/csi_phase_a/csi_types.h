@@ -64,6 +64,8 @@ typedef struct {
     uint64_t timestamp_ms;
     csi_feature_metrics_t metrics;
     envelope_state_hint_t state_hint;
+    float motion_score;
+    float confidence;
     csi_sample_quality_t quality_state;
 } csi_feature_frame_t;
 

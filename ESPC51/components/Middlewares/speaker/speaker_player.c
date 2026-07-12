@@ -31,6 +31,17 @@
 
 static const char *TAG = "speaker_player";
 
+static void speaker_player_log_writer_task_alloc_check(void)
+{
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    ESP_LOGI(TAG,
+             "SPEAKER_IIS_WRITER_TASK_ALLOC_CHECK free=%u min_free=%u largest=%u stack_size=%u",
+             (unsigned int)heap_caps_get_free_size(caps),
+             (unsigned int)heap_caps_get_minimum_free_size(caps),
+             (unsigned int)heap_caps_get_largest_free_block(caps),
+             (unsigned int)AUDIO_PLAYER_I2S_WRITER_TASK_STACK_SIZE);
+}
+
 /* 环形缓冲区内部条目类型，仅供本实现的 writer task 识别。 */
 #define AUDIO_PLAYER_RING_ITEM_TYPE_PCM 1U
 #define AUDIO_PLAYER_RING_ITEM_TYPE_END 2U
@@ -726,6 +737,7 @@ esp_err_t audio_player_stream_open(void)
         goto open_fail;
     }
 
+    speaker_player_log_writer_task_alloc_check();
     BaseType_t task_created = xTaskCreate(speaker_player_iis_writer_task,
                                           "speaker_iis_writer",
                                           AUDIO_PLAYER_I2S_WRITER_TASK_STACK_SIZE,
@@ -974,6 +986,7 @@ esp_err_t audio_player_play_pcm(const int16_t *data, uint32_t samples)
         goto play_cleanup;
     }
 
+    speaker_player_log_writer_task_alloc_check();
     BaseType_t task_created = xTaskCreate(speaker_player_iis_writer_task,
                                           "speaker_iis_writer",
                                           AUDIO_PLAYER_I2S_WRITER_TASK_STACK_SIZE,

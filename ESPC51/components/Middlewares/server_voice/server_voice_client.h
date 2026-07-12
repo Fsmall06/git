@@ -21,7 +21,7 @@
 #endif
 
 #ifndef SERVER_VOICE_RESPONSE_TASK_STACK
-#define SERVER_VOICE_RESPONSE_TASK_STACK 12288 // 响应读取/播放任务栈，单位字节。
+#define SERVER_VOICE_RESPONSE_TASK_STACK 8192 // 响应读取/播放任务栈，单位字节。
 #endif
 
 #ifndef SERVER_VOICE_RESPONSE_TASK_PRIORITY

@@ -14,6 +14,7 @@
 #include "driver/gpio.h"
 #include "driver/i2s_pdm.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -37,6 +38,16 @@ static bool s_tx_enabled = false;
 /* 保护 init/start/stop 状态切换，避免播放任务与初始化路径并发操作 channel。 */
 static SemaphoreHandle_t s_iis_mutex = NULL;
 static bool s_iis_config_logged = false;
+
+static void iis_log_dma_heap_before_init(void)
+{
+    ESP_LOGI(TAG,
+             "IIS_DMA_CHECK\ninternal_free=%u\ninternal_largest=%u\ndma_free=%u\ndma_largest=%u",
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned int)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+}
 
 static void iis_log_values(const char *message,
                            int64_t value0,
@@ -240,6 +251,7 @@ esp_err_t iis_init(void)
                    chan_cfg.dma_frame_num,
                    chan_cfg.dma_desc_num * chan_cfg.dma_frame_num);
 
+    iis_log_dma_heap_before_init();
     err = i2s_new_channel(&chan_cfg, &s_tx_chan, NULL);
     if (err != ESP_OK) {
         s_tx_chan = NULL;

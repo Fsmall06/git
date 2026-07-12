@@ -352,7 +352,10 @@ typedef struct _bme690_data_t
     bool new_data;                  /* 是否读到芯片标记的新数据 */
     bool gas_valid;                 /* gas resistance 是否有效 */
     bool heat_stable;               /* heater 是否达到稳定状态 */
+    uint16_t gas_adc;               /* gas ADC 原始值，仅用于诊断上报 */
     uint8_t gas_range;              /* gas ADC 当前量程，用于调试 gas resistance 计算 */
+    uint16_t heater_temp;           /* 当前 heater 目标温度，单位摄氏度 */
+    uint16_t heater_time_ms;        /* 当前 heater 保持时间，单位毫秒 */
     uint8_t gas_index;              /* 芯片返回的 gas index，用于调试 profile 顺序 */
     uint8_t measurement_index;      /* 芯片返回的测量序号，用于判断数据更新 */
 } bme690_data_t;

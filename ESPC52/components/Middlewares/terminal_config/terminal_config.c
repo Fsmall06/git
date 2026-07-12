@@ -32,6 +32,19 @@ static terminal_runtime_config_t s_config = {
 };
 static bool s_loaded;
 
+static void terminal_config_recover_identity(void)
+{
+    if (strcmp(s_config.device_id, TERMINAL_CONFIG_DEFAULT_DEVICE_ID) != 0) {
+        ESP_LOGW(TAG,
+                 "terminal identity recovered stale_device_id=%s firmware_device_id=%s",
+                 s_config.device_id,
+                 TERMINAL_CONFIG_DEFAULT_DEVICE_ID);
+        strlcpy(s_config.device_id,
+                TERMINAL_CONFIG_DEFAULT_DEVICE_ID,
+                sizeof(s_config.device_id));
+    }
+}
+
 static void terminal_config_reset_defaults(void)
 {
     memset(&s_config, 0, sizeof(s_config));
@@ -71,6 +84,35 @@ static void terminal_config_load_string(nvs_handle_t nvs,
     out[out_size - 1U] = '\0';
 }
 
+static void terminal_config_clear_stale_identity_keys(nvs_handle_t nvs)
+{
+    static const char *const stale_keys[] = {
+        "device_id",
+        "local_id",
+    };
+    bool changed = false;
+
+    for (size_t i = 0; i < sizeof(stale_keys) / sizeof(stale_keys[0]); ++i) {
+        esp_err_t ret = nvs_erase_key(nvs, stale_keys[i]);
+        if (ret == ESP_OK) {
+            changed = true;
+            ESP_LOGW(TAG, "cleared stale identity key from NVS key=%s", stale_keys[i]);
+        } else if (ret != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG,
+                     "failed to clear stale identity key=%s ret=%s",
+                     stale_keys[i],
+                     esp_err_to_name(ret));
+        }
+    }
+
+    if (changed) {
+        esp_err_t commit_ret = nvs_commit(nvs);
+        if (commit_ret != ESP_OK) {
+            ESP_LOGW(TAG, "stale identity NVS commit failed ret=%s", esp_err_to_name(commit_ret));
+        }
+    }
+}
+
 esp_err_t terminal_config_load(void)
 {
     if (s_loaded) {
@@ -80,12 +122,14 @@ esp_err_t terminal_config_load(void)
     terminal_config_reset_defaults();
 
     nvs_handle_t nvs = 0;
-    esp_err_t ret = nvs_open(TERMINAL_CONFIG_NVS_NAMESPACE, NVS_READONLY, &nvs);
+    esp_err_t ret = nvs_open(TERMINAL_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        terminal_config_recover_identity();
         s_loaded = true;
         ESP_LOGI(TAG,
-                 "terminal config uses defaults device_id=%s gateway_id=%s ssid=%s",
+                 "terminal config uses defaults device_id=%s local_id=%u gateway_id=%s ssid=%s",
                  s_config.device_id,
+                 (unsigned int)TERMINAL_CONFIG_DEFAULT_LOCAL_ID,
                  s_config.gateway_id,
                  s_config.gateway_ssid);
         return ESP_OK;
@@ -98,6 +142,7 @@ esp_err_t terminal_config_load(void)
 
     /* Identity is firmware-defined. Do not let stale NVS keys from another
      * flashed image override device_id/local_id-derived behavior. */
+    terminal_config_clear_stale_identity_keys(nvs);
     terminal_config_load_string(nvs,
                                 "gateway_ssid",
                                 s_config.gateway_ssid,
@@ -119,10 +164,12 @@ esp_err_t terminal_config_load(void)
     }
 
     nvs_close(nvs);
+    terminal_config_recover_identity();
     s_loaded = true;
     ESP_LOGI(TAG,
-             "terminal config loaded device_id=%s gateway_id=%s room_id=%s alias=%s ssid=%s",
+             "terminal config loaded device_id=%s local_id=%u gateway_id=%s room_id=%s alias=%s ssid=%s",
              s_config.device_id,
+             (unsigned int)TERMINAL_CONFIG_DEFAULT_LOCAL_ID,
              s_config.gateway_id,
              s_config.room_id,
              s_config.alias,
@@ -133,6 +180,7 @@ esp_err_t terminal_config_load(void)
 const terminal_runtime_config_t *terminal_config_get(void)
 {
     (void)terminal_config_load();
+    terminal_config_recover_identity();
     return &s_config;
 }
 
@@ -178,13 +226,7 @@ uint32_t terminal_config_get_upload_period_ms(void)
 
 uint8_t terminal_config_get_local_id(void)
 {
-    const char *device_id = terminal_config_get_device_id();
-    if (strcmp(device_id, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C52) == 0) {
-        return ESP111_PROTOCOL_LOCAL_DEVICE_ID_C52;
-    }
-    if (strcmp(device_id, ESP111_PROTOCOL_TERMINAL_DEVICE_ID_C51) == 0) {
-        return ESP111_PROTOCOL_LOCAL_DEVICE_ID_C51;
-    }
+    (void)terminal_config_get();
     return TERMINAL_CONFIG_DEFAULT_LOCAL_ID;
 }
 

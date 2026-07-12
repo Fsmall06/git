@@ -23,6 +23,7 @@
 #include "network_worker.h"
 #include "offline_policy.h"
 #include "protocol_adapter.h"
+#include "resource_manager.h"
 #include "sensor_aggregator.h"
 #include "server_client.h"
 
@@ -55,10 +56,44 @@ static SemaphoreHandle_t s_poll_lock;
 static uint32_t s_command_seq;
 static child_registry_entry_t s_poll_entries[GATEWAY_CONFIG_MAX_CHILDREN];
 static char s_poll_server_body[SERVER_CLIENT_SMALL_BODY_BYTES];
+static bool s_peer_active[GATEWAY_CONFIG_MAX_CHILDREN];
 
 static int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+static size_t peer_index(const char *device_id)
+{
+    if (device_id == NULL || device_id[0] == '\0') {
+        return GATEWAY_CONFIG_MAX_CHILDREN;
+    }
+
+    const gateway_runtime_config_t *config = gateway_config_get();
+    size_t count = config->children_allowlist_count;
+    if (count > GATEWAY_CONFIG_MAX_CHILDREN) {
+        count = GATEWAY_CONFIG_MAX_CHILDREN;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (config->children_allowlist[i] != NULL &&
+            strcmp(config->children_allowlist[i], device_id) == 0) {
+            return i;
+        }
+    }
+    return GATEWAY_CONFIG_MAX_CHILDREN;
+}
+
+static bool peer_active_locked(const char *device_id)
+{
+    const size_t index = peer_index(device_id);
+    return index < GATEWAY_CONFIG_MAX_CHILDREN && s_peer_active[index];
+}
+
+static bool command_poll_cancelled(void *ctx)
+{
+    const char *device_id = (const char *)ctx;
+    return !command_router_peer_active(device_id) ||
+           !resource_manager_is_live(device_id);
 }
 
 static command_entry_t *find_locked(const char *command_id)
@@ -187,6 +222,10 @@ static esp_err_t command_router_ingest_server_pending(const char *device_id, con
     if (device_id == NULL || server_body == NULL || server_body[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!command_router_peer_active(device_id) ||
+        !resource_manager_is_live(device_id)) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     cJSON *root = cJSON_Parse(server_body);
     if (root == NULL) {
@@ -227,12 +266,14 @@ static esp_err_t command_router_ingest_server_pending(const char *device_id, con
         }
 
         xSemaphoreTake(s_lock, portMAX_DELAY);
-        esp_err_t ret = enqueue_locked(command_id->valuestring,
-                                       device_id,
-                                       map_server_command_type(name->valuestring),
-                                       params_json,
-                                       "server",
-                                       ttl_ms);
+        esp_err_t ret = peer_active_locked(device_id) ?
+                            enqueue_locked(command_id->valuestring,
+                                           device_id,
+                                           map_server_command_type(name->valuestring),
+                                           params_json,
+                                           "server",
+                                           ttl_ms) :
+                            ESP_ERR_INVALID_STATE;
         xSemaphoreGive(s_lock);
         if (ret != ESP_OK && first_error == ESP_OK) {
             first_error = ret;
@@ -271,10 +312,73 @@ esp_err_t command_router_init(void)
         }
     }
     memset(s_queue, 0, sizeof(s_queue));
+    memset(s_peer_active, 0, sizeof(s_peer_active));
     s_command_seq = 0;
     ESP_LOGI(TAG, "local command queue initialized size=%u",
              (unsigned int)GATEWAY_CONFIG_COMMAND_QUEUE_SIZE);
     return ESP_OK;
+}
+
+esp_err_t command_router_suspend_peer(const char *device_id)
+{
+    const size_t index = peer_index(device_id);
+    if (index >= GATEWAY_CONFIG_MAX_CHILDREN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_peer_active[index] = false;
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
+}
+
+esp_err_t command_router_restore_peer(const char *device_id)
+{
+    const size_t index = peer_index(device_id);
+    if (index >= GATEWAY_CONFIG_MAX_CHILDREN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_peer_active[index] = true;
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
+}
+
+bool command_router_peer_active(const char *device_id)
+{
+    if (s_lock == NULL) {
+        return false;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const bool active = peer_active_locked(device_id);
+    xSemaphoreGive(s_lock);
+    return active;
+}
+
+bool command_router_has_active_peers(void)
+{
+    if (s_lock == NULL) {
+        return false;
+    }
+
+    bool active = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (size_t i = 0; i < GATEWAY_CONFIG_MAX_CHILDREN; ++i) {
+        if (s_peer_active[i]) {
+            active = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return active;
 }
 
 esp_err_t command_router_enqueue(const char *target_device_id,
@@ -300,16 +404,25 @@ esp_err_t command_router_enqueue(const char *target_device_id,
 
 static void command_router_poll_server_pending_for_device(const char *device_id)
 {
-    if (device_id == NULL || device_id[0] == '\0') {
+    if (device_id == NULL || device_id[0] == '\0' ||
+        !command_router_peer_active(device_id) ||
+        !resource_manager_is_live(device_id)) {
         return;
     }
 
     s_poll_server_body[0] = '\0';
     int server_status = 0;
-    esp_err_t server_ret = server_client_get_pending_commands(device_id,
-                                                              s_poll_server_body,
-                                                              sizeof(s_poll_server_body),
-                                                              &server_status);
+    esp_err_t server_ret = server_client_get_pending_commands_cancellable(
+        device_id,
+        s_poll_server_body,
+        sizeof(s_poll_server_body),
+        &server_status,
+        command_poll_cancelled,
+        (void *)device_id);
+    if (!command_router_peer_active(device_id) ||
+        !resource_manager_is_live(device_id)) {
+        return;
+    }
     offline_policy_record_server_result(server_ret, server_status);
     if (server_ret != ESP_OK) {
         ESP_LOGD(TAG,
@@ -340,7 +453,9 @@ void command_router_poll_server_pending(void)
     size_t count = child_registry_snapshot(s_poll_entries, GATEWAY_CONFIG_MAX_CHILDREN);
     for (size_t i = 0; i < count; ++i) {
         if (!s_poll_entries[i].registered || !s_poll_entries[i].online ||
-            s_poll_entries[i].device_id[0] == '\0') {
+            s_poll_entries[i].device_id[0] == '\0' ||
+            !command_router_peer_active(s_poll_entries[i].device_id) ||
+            !resource_manager_is_live(s_poll_entries[i].device_id)) {
             continue;
         }
 
@@ -374,33 +489,35 @@ esp_err_t command_router_build_pending_json(const char *device_id, char *out, si
 
     bool first = true;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    for (size_t i = 0; i < GATEWAY_CONFIG_COMMAND_QUEUE_SIZE; i++) {
-        command_entry_t *entry = &s_queue[i];
-        if (entry->state != COMMAND_STATE_QUEUED ||
-            strcmp(entry->target_device_id, device_id) != 0) {
-            continue;
-        }
+    if (peer_active_locked(device_id) && resource_manager_is_live(device_id)) {
+        for (size_t i = 0; i < GATEWAY_CONFIG_COMMAND_QUEUE_SIZE; i++) {
+            command_entry_t *entry = &s_queue[i];
+            if (entry->state != COMMAND_STATE_QUEUED ||
+                strcmp(entry->target_device_id, device_id) != 0) {
+                continue;
+            }
 
-        written = snprintf(out + len,
-                           out_size - len,
-                           "%s{\"" ESP111_PROTOCOL_LOCAL_JSON_COMMAND_ID "\":\"%s\","
-                           "\"" ESP111_PROTOCOL_LOCAL_JSON_COMMAND_CODE "\":%u,"
-                           "\"seq\":%u,\"ttl_ms\":%u,"
-                           "\"" ESP111_PROTOCOL_LOCAL_JSON_COMMAND_ARGS "\":%s}",
-                           first ? "" : ",",
-                           entry->command_id,
-                           map_local_command_code(entry->command_type),
-                           (unsigned int)entry->seq,
-                           (unsigned int)entry->ttl_ms,
-                           entry->params_json[0] != '\0' ? entry->params_json : "{}");
-        if (written <= 0 || written >= (int)(out_size - len)) {
-            xSemaphoreGive(s_lock);
-            return ESP_ERR_INVALID_SIZE;
+            written = snprintf(out + len,
+                               out_size - len,
+                               "%s{\"" ESP111_PROTOCOL_LOCAL_JSON_COMMAND_ID "\":\"%s\","
+                               "\"" ESP111_PROTOCOL_LOCAL_JSON_COMMAND_CODE "\":%u,"
+                               "\"seq\":%u,\"ttl_ms\":%u,"
+                               "\"" ESP111_PROTOCOL_LOCAL_JSON_COMMAND_ARGS "\":%s}",
+                               first ? "" : ",",
+                               entry->command_id,
+                               map_local_command_code(entry->command_type),
+                               (unsigned int)entry->seq,
+                               (unsigned int)entry->ttl_ms,
+                               entry->params_json[0] != '\0' ? entry->params_json : "{}");
+            if (written <= 0 || written >= (int)(out_size - len)) {
+                xSemaphoreGive(s_lock);
+                return ESP_ERR_INVALID_SIZE;
+            }
+            len += (size_t)written;
+            first = false;
+            entry->state = COMMAND_STATE_DISPATCHED;
+            entry->dispatched_ms = now_ms();
         }
-        len += (size_t)written;
-        first = false;
-        entry->state = COMMAND_STATE_DISPATCHED;
-        entry->dispatched_ms = now_ms();
     }
     xSemaphoreGive(s_lock);
 

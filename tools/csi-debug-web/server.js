@@ -98,11 +98,17 @@ function clearHistory() {
 }
 
 function normalizeDeviceId(sample) {
-  if (sample && sample.device_id !== undefined && sample.device_id !== null && String(sample.device_id).trim()) {
-    return String(sample.device_id).trim();
-  }
-  if (sample && sample.deviceId !== undefined && sample.deviceId !== null && String(sample.deviceId).trim()) {
-    return String(sample.deviceId).trim();
+  const candidates = [
+    sample && sample.device_id,
+    sample && sample.deviceId,
+    sample && sample.device,
+    sample && sample.did,
+    sample && sample.id,
+  ];
+  for (const candidate of candidates) {
+    if (candidate !== undefined && candidate !== null && String(candidate).trim()) {
+      return String(candidate).trim();
+    }
   }
   return DEFAULT_DEVICE_ID;
 }
@@ -294,6 +300,9 @@ function parseKeyValuePayload(payload) {
 function findMarkerPayload(line) {
   const markers = [
     { marker: 'CSI_FUSION_TELEMETRY', sourceFormat: 'CSI_FUSION_TELEMETRY' },
+    { marker: 'CSI_RESULT_V2', sourceFormat: 'CSI_RESULT_V2' },
+    { marker: 'CSI_RX', sourceFormat: 'CSI_RX' },
+    { marker: 'CSI_LATEST', sourceFormat: 'CSI_LATEST' },
     { marker: 'CSI_C5_FEATURE', sourceFormat: 'CSI_C5_FEATURE' },
     { marker: 'CSI_CANONICAL_EVENT', sourceFormat: 'CSI_CANONICAL_EVENT' },
     { marker: 'csi_service: csi summary', sourceFormat: 'csi summary' },
@@ -648,15 +657,24 @@ function getLatestPayload() {
   const latest = Object.fromEntries(latestEntries);
   const latestSample = globalHistory[globalHistory.length - 1] || null;
   const telemetry = latestTelemetryModel(Math.min(DEFAULT_LIMIT, 1000));
+  const motionStateModel = telemetry.motion_state_model || {};
+  const legacyLinks = Array.isArray(motionStateModel.legacy_link_ids)
+    ? motionStateModel.legacy_link_ids
+    : Array.isArray(motionStateModel.legacy_links)
+      ? motionStateModel.legacy_links.map((card) => card.link_id)
+      : [];
   return {
     ok: true,
     count: globalHistory.length,
     devices: latestEntries.map(([device]) => device),
-    links: LINK_IDS,
+    links: motionStateModel.active_link_ids || LINK_IDS,
+    active_links: motionStateModel.active_link_ids || LINK_IDS,
+    legacy_links: legacyLinks,
     latest,
     latest_sample: latestSample,
     sample: latestSample,
     fusion_status: telemetry.fusion_status,
+    motion_state_model: motionStateModel,
     telemetry,
     status: latestSample
       ? {
@@ -734,10 +752,15 @@ function jsonToCsv(rows) {
     'motion_score',
     'energy',
     'variance',
+    'cv',
     'quality',
     'rssi',
     'state',
     'confidence',
+    'age_ms',
+    'updated_at_ms',
+    'sample_count',
+    'bytes',
     'tick_id',
     'frame_seq',
     'source_format',
@@ -985,6 +1008,18 @@ process.on('SIGINT', () => {
 
 process.on('SIGTERM', () => {
   shutdown().catch(() => process.exit(1));
+});
+
+server.on('error', (error) => {
+  if (error && error.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use.`);
+    console.error(`Run: lsof -nP -iTCP:${PORT} -sTCP:LISTEN`);
+    console.error('Then: kill <PID>');
+    console.error('Or: PORT=8788 npm start');
+    process.exit(1);
+  }
+  console.error(error);
+  process.exit(1);
 });
 
 server.listen(PORT, HOST, () => {

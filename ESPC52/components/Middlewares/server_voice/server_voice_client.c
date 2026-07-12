@@ -33,6 +33,15 @@ static const char *TAG = "server_voice_client";
 #define SERVER_VOICE_UPLOAD_INITIAL_BYTES (16U * 1024U)
 #define SERVER_VOICE_UPLOAD_MAX_BYTES (320U * 1024U)
 
+/* Keep the existing SERVER_VOICE_HTTP_* configuration entry points available. */
+#ifndef VOICE_CONNECT_TIMEOUT_MS
+#define VOICE_CONNECT_TIMEOUT_MS SERVER_VOICE_HTTP_CONNECT_TIMEOUT_MS
+#endif
+
+#ifndef VOICE_HEADER_TIMEOUT_MS
+#define VOICE_HEADER_TIMEOUT_MS SERVER_VOICE_HTTP_FETCH_HEADERS_TIMEOUT_MS
+#endif
+
 typedef enum {
     SERVER_VOICE_STATE_IDLE = 0,
     SERVER_VOICE_STATE_PREPARING,
@@ -171,8 +180,18 @@ static esp_err_t server_voice_ensure_upload_capacity(size_t required)
         new_capacity = SERVER_VOICE_UPLOAD_MAX_BYTES;
     }
 
-    uint8_t *new_buf =
-        (uint8_t *)heap_caps_realloc(s_voice.upload_buf, new_capacity, MALLOC_CAP_8BIT);
+    uint8_t *new_buf = (uint8_t *)heap_caps_realloc(s_voice.upload_buf,
+                                                     new_capacity,
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (new_buf == NULL) {
+        ESP_LOGW(TAG,
+                 "local voice upload buffer PSRAM alloc failed; retrying internal required=%u capacity=%u",
+                 (unsigned int)required,
+                 (unsigned int)new_capacity);
+        new_buf = (uint8_t *)heap_caps_realloc(s_voice.upload_buf,
+                                               new_capacity,
+                                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
     if (new_buf == NULL) {
         ESP_LOGE(TAG,
                  "local voice upload buffer alloc failed required=%u capacity=%u",
@@ -399,7 +418,7 @@ static void server_voice_response_task(void *arg)
     ESP_LOGI(TAG,
              "fetch headers begin timestamp=%lld timeout_ms=%u",
              (long long)s_voice.fetch_headers_begin_ms,
-             (unsigned int)SERVER_VOICE_HTTP_FETCH_HEADERS_TIMEOUT_MS);
+             (unsigned int)VOICE_HEADER_TIMEOUT_MS);
     ret = server_voice_abort_requested() ? ESP_ERR_INVALID_STATE :
                                            server_comm_http_fetch_headers(s_voice.stream, &response);
     s_voice.fetch_headers_end_ms = server_voice_now_ms();
@@ -643,20 +662,20 @@ esp_err_t server_voice_client_finish_turn(void)
         .content_type = SERVER_VOICE_REQUEST_CONTENT_TYPE,
         .headers = headers,
         .header_count = header_count,
-        .timeout_ms = SERVER_VOICE_HTTP_CONNECT_TIMEOUT_MS,
-        .fetch_headers_timeout_ms = SERVER_VOICE_HTTP_FETCH_HEADERS_TIMEOUT_MS,
-        .read_timeout_ms = SERVER_VOICE_HTTP_READ_TIMEOUT_MS,
-        .total_timeout_ms = SERVER_VOICE_HTTP_TURN_TIMEOUT_MS,
+        .timeout_ms = VOICE_CONNECT_TIMEOUT_MS,
+        .fetch_headers_timeout_ms = VOICE_HEADER_TIMEOUT_MS,
+        .read_timeout_ms = VOICE_READ_TIMEOUT_MS,
+        .total_timeout_ms = VOICE_REQUEST_TIMEOUT_MS,
         .buffer_size = SERVER_VOICE_READ_CHUNK_BYTES,
         .tx_buffer_size = 512,
     };
 
     ESP_LOGI(TAG,
              "voice http timeout config connect_ms=%u fetch_headers_ms=%u read_ms=%u turn_ms=%u",
-             (unsigned int)SERVER_VOICE_HTTP_CONNECT_TIMEOUT_MS,
-             (unsigned int)SERVER_VOICE_HTTP_FETCH_HEADERS_TIMEOUT_MS,
-             (unsigned int)SERVER_VOICE_HTTP_READ_TIMEOUT_MS,
-             (unsigned int)SERVER_VOICE_HTTP_TURN_TIMEOUT_MS);
+             (unsigned int)VOICE_CONNECT_TIMEOUT_MS,
+             (unsigned int)VOICE_HEADER_TIMEOUT_MS,
+             (unsigned int)VOICE_READ_TIMEOUT_MS,
+             (unsigned int)VOICE_REQUEST_TIMEOUT_MS);
     server_voice_log_heap("local voice fixed POST before");
     /*
      * 语音独占模式下只有 server_voice_client 允许继续走本地 HTTP。这里临时允许
@@ -669,7 +688,7 @@ esp_err_t server_voice_client_finish_turn(void)
              "request start timestamp=%lld endpoint=%s timeout_ms=%u upload pcm bytes=%u",
              (long long)request_start_ms,
              SERVER_VOICE_TURN_ENDPOINT,
-             (unsigned int)SERVER_VOICE_HTTP_TURN_TIMEOUT_MS,
+             (unsigned int)VOICE_REQUEST_TIMEOUT_MS,
              (unsigned int)s_voice.upload_bytes);
     esp_err_t ret = server_comm_http_post_raw_fixed_stream_begin(&stream_config,
                                                                  s_voice.upload_buf,
@@ -704,6 +723,18 @@ esp_err_t server_voice_client_finish_turn(void)
     s_voice.upload_capacity = 0;
 
     server_voice_set_state(SERVER_VOICE_STATE_FINISHING);
+    size_t voice_rx_free =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t voice_rx_min_free =
+        heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t voice_rx_largest =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG,
+             "VOICE_RX_TASK_ALLOC_CHECK free=%u min_free=%u largest=%u stack_size=%u",
+             (unsigned int)voice_rx_free,
+             (unsigned int)voice_rx_min_free,
+             (unsigned int)voice_rx_largest,
+             (unsigned int)SERVER_VOICE_RESPONSE_TASK_STACK);
     BaseType_t created = xTaskCreate(server_voice_response_task,
                                      "server_voice_rx",
                                      SERVER_VOICE_RESPONSE_TASK_STACK,
@@ -711,6 +742,17 @@ esp_err_t server_voice_client_finish_turn(void)
                                      SERVER_VOICE_RESPONSE_TASK_PRIORITY,
                                      &s_voice.response_task);
     if (created != pdPASS) {
+        voice_rx_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        voice_rx_min_free =
+            heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        voice_rx_largest =
+            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_LOGE(TAG,
+                 "VOICE_RX_TASK_CREATE_FAILED free=%u min_free=%u largest=%u stack_size=%u",
+                 (unsigned int)voice_rx_free,
+                 (unsigned int)voice_rx_min_free,
+                 (unsigned int)voice_rx_largest,
+                 (unsigned int)SERVER_VOICE_RESPONSE_TASK_STACK);
         server_voice_cleanup_client();
         server_voice_set_state(SERVER_VOICE_STATE_IDLE);
         return ESP_ERR_NO_MEM;

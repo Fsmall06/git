@@ -21,7 +21,7 @@ extern "C" {
 #define DEVICE_PROTOCOL_VERSION 2
 #define ENVELOPE_BUILDER_SCHEMA_VERSION "v2"
 #define ENVELOPE_BUILDER_SOURCE_CSI_PHASE_A "csi_phase_a"
-#define ENVELOPE_BUILDER_JSON_MAX_BYTES 384U
+#define ENVELOPE_BUILDER_JSON_MAX_BYTES 512U
 #define ENVELOPE_BUILDER_TRACE_ID_LEN 37U
 
 typedef enum {
@@ -41,11 +41,14 @@ typedef struct {
 
 /** envelope_builder_format() 的完整输入；字符串指针由调用方持有。 */
 typedef struct {
+    const char *local_id;
     const char *device_id;
     const char *link_id;
     int64_t timestamp_ms;
     envelope_metrics_t metrics;
     envelope_state_hint_t state_hint;
+    float motion_score;
+    float confidence;
     const char *source;
 } envelope_builder_input_t;
 

@@ -30,10 +30,18 @@ typedef struct {
 
 /** @brief 初始化 sensor/status 聚合器；gateway_orchestrator_start() 调用，当前无状态。 */
 void sensor_aggregator_init(void);
+/** @brief 暂停指定 C5 的实时 sensor 上云和 cache replay；幂等且保留 latest/history/cache。 */
+esp_err_t sensor_aggregator_suspend_peer(const char *device_id);
+/** @brief 恢复指定 C5 的 sensor 上云资源；幂等且不修改已有聚合数据。 */
+esp_err_t sensor_aggregator_restore_peer(const char *device_id);
+/** @brief 返回指定 C5 的 sensor 资源是否已恢复。 */
+bool sensor_aggregator_peer_active(const char *device_id);
+/** @brief 返回是否至少有一个 C5 的 sensor 资源处于 active。 */
+bool sensor_aggregator_has_active_peers(void);
 /** @brief 构造并上传一次 dashboard snapshot；gateway periodic task 调用。 */
 void sensor_aggregator_upload_snapshot(void);
 /** @brief worker 线程内立即构造并上传一次 dashboard snapshot。 */
-void sensor_aggregator_upload_snapshot_now(void);
+esp_err_t sensor_aggregator_upload_snapshot_now(void);
 /**
  * @brief 处理一条 status 或 sensor envelope。
  *

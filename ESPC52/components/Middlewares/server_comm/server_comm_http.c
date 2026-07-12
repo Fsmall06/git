@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -39,6 +40,11 @@ typedef struct {
     bool overflow;
 } server_comm_body_ctx_t;
 
+typedef struct {
+    server_comm_body_ctx_t *body_ctx;
+    server_comm_http_response_t *response;
+} server_comm_event_ctx_t;
+
 struct server_comm_raw_stream {
     esp_http_client_handle_t client;
     TaskHandle_t owner_task;
@@ -52,7 +58,11 @@ struct server_comm_raw_stream {
     int64_t first_response_byte_ms;
     size_t upload_bytes;
     size_t response_bytes;
+    server_comm_http_response_t response_headers;
+    server_comm_event_ctx_t event_ctx;
 };
+
+static void server_comm_reset_response(server_comm_http_response_t *response);
 
 static portMUX_TYPE s_server_comm_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_voice_request_task;
@@ -205,6 +215,9 @@ static void server_comm_stream_apply_timing(server_comm_raw_stream_t *stream,
     stream->total_timeout_ms = config->total_timeout_ms;
     stream->start_ms = server_comm_now_ms();
     stream->detailed_errors = server_comm_endpoint_is_wake_prompt(config->endpoint);
+    server_comm_reset_response(&stream->response_headers);
+    stream->event_ctx.body_ctx = NULL;
+    stream->event_ctx.response = &stream->response_headers;
 }
 
 static esp_err_t server_comm_classify_header_open_error(esp_err_t ret, bool detailed)
@@ -332,17 +345,60 @@ static esp_err_t server_comm_check_ready(const char *label, const char *endpoint
     return ESP_OK;
 }
 
+static void server_comm_capture_response_header(server_comm_http_response_t *response,
+                                                const char *key,
+                                                const char *value)
+{
+    if (response == NULL || key == NULL || value == NULL) {
+        return;
+    }
+
+    if (strcasecmp(key, "Content-Type") == 0) {
+        strlcpy(response->content_type, value, sizeof(response->content_type));
+    } else if (strcasecmp(key, "Content-Length") == 0) {
+        char *end = NULL;
+        long long length = strtoll(value, &end, 10);
+        if (end != value && length >= 0) {
+            response->content_length = (int64_t)length;
+        }
+    } else if (strcasecmp(key, "Transfer-Encoding") == 0) {
+        strlcpy(response->transfer_encoding, value, sizeof(response->transfer_encoding));
+    } else if (strcasecmp(key, "X-Audio-Sample-Rate") == 0 ||
+               strcasecmp(key, "X-Sample-Rate") == 0) {
+        strlcpy(response->audio_sample_rate, value, sizeof(response->audio_sample_rate));
+    } else if (strcasecmp(key, "X-Audio-Format") == 0) {
+        strlcpy(response->audio_format, value, sizeof(response->audio_format));
+    } else if (strcasecmp(key, "X-Audio-Channels") == 0 ||
+               strcasecmp(key, "X-Channels") == 0) {
+        strlcpy(response->audio_channels, value, sizeof(response->audio_channels));
+    } else if (strcasecmp(key, "X-Audio-Version") == 0 ||
+               strcasecmp(key, "X-Prompt-Version") == 0) {
+        strlcpy(response->audio_version, value, sizeof(response->audio_version));
+    } else if (strcasecmp(key, "X-Audio-Config-Hash") == 0 ||
+               strcasecmp(key, "X-Voice-Config-Hash") == 0) {
+        strlcpy(response->voice_config_hash, value, sizeof(response->voice_config_hash));
+    }
+}
+
 static esp_err_t server_comm_body_event_handler(esp_http_client_event_t *evt)
 {
     if (evt == NULL || evt->user_data == NULL) {
         return ESP_OK;
     }
 
-    if (evt->event_id != HTTP_EVENT_ON_DATA || evt->data == NULL || evt->data_len <= 0) {
+    server_comm_event_ctx_t *event_ctx = (server_comm_event_ctx_t *)evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_HEADER) {
+        server_comm_capture_response_header(event_ctx->response,
+                                            evt->header_key,
+                                            evt->header_value);
+        return ESP_OK;
+    }
+    if (evt->event_id != HTTP_EVENT_ON_DATA || evt->data == NULL || evt->data_len <= 0 ||
+        event_ctx->body_ctx == NULL) {
         return ESP_OK;
     }
 
-    server_comm_body_ctx_t *ctx = (server_comm_body_ctx_t *)evt->user_data;
+    server_comm_body_ctx_t *ctx = event_ctx->body_ctx;
     if (ctx->buf == NULL || ctx->buf_size == 0) {
         return ESP_OK;
     }
@@ -377,60 +433,49 @@ static void server_comm_reset_response(server_comm_http_response_t *response)
 
 static void server_comm_capture_response_info(esp_http_client_handle_t client,
                                               server_comm_body_ctx_t *body_ctx,
+                                              const server_comm_http_response_t *captured_headers,
                                               server_comm_http_response_t *response)
 {
     if (response == NULL || client == NULL) {
         return;
     }
 
+    if (captured_headers != NULL && captured_headers != response) {
+        response->content_length = captured_headers->content_length;
+        strlcpy(response->content_type,
+                captured_headers->content_type,
+                sizeof(response->content_type));
+        strlcpy(response->transfer_encoding,
+                captured_headers->transfer_encoding,
+                sizeof(response->transfer_encoding));
+        strlcpy(response->audio_format,
+                captured_headers->audio_format,
+                sizeof(response->audio_format));
+        strlcpy(response->audio_sample_rate,
+                captured_headers->audio_sample_rate,
+                sizeof(response->audio_sample_rate));
+        strlcpy(response->audio_channels,
+                captured_headers->audio_channels,
+                sizeof(response->audio_channels));
+        strlcpy(response->audio_version,
+                captured_headers->audio_version,
+                sizeof(response->audio_version));
+        strlcpy(response->voice_config_hash,
+                captured_headers->voice_config_hash,
+                sizeof(response->voice_config_hash));
+    }
+
     response->status_code = esp_http_client_get_status_code(client);
-    response->content_length = esp_http_client_get_content_length(client);
+    int64_t content_length = esp_http_client_get_content_length(client);
+    if (content_length >= 0 || response->content_length < 0) {
+        response->content_length = content_length;
+    }
     response->chunked = esp_http_client_is_chunked_response(client);
     if (body_ctx != NULL) {
         response->body_len = body_ctx->len;
         response->body_overflow = body_ctx->overflow;
     }
 
-    char *content_type = NULL;
-    if (esp_http_client_get_header(client, "Content-Type", &content_type) == ESP_OK &&
-        content_type != NULL) {
-        strlcpy(response->content_type, content_type, sizeof(response->content_type));
-    }
-    char *value = NULL;
-    if (esp_http_client_get_header(client, "X-Audio-Format", &value) == ESP_OK && value != NULL) {
-        strlcpy(response->audio_format, value, sizeof(response->audio_format));
-    }
-    value = NULL;
-    if (esp_http_client_get_header(client, "X-Audio-Sample-Rate", &value) == ESP_OK && value != NULL) {
-        strlcpy(response->audio_sample_rate, value, sizeof(response->audio_sample_rate));
-    } else {
-        value = NULL;
-        if (esp_http_client_get_header(client, "X-Sample-Rate", &value) == ESP_OK && value != NULL) {
-            strlcpy(response->audio_sample_rate, value, sizeof(response->audio_sample_rate));
-        }
-    }
-    value = NULL;
-    if (esp_http_client_get_header(client, "X-Audio-Channels", &value) == ESP_OK && value != NULL) {
-        strlcpy(response->audio_channels, value, sizeof(response->audio_channels));
-    } else {
-        value = NULL;
-        if (esp_http_client_get_header(client, "X-Channels", &value) == ESP_OK && value != NULL) {
-            strlcpy(response->audio_channels, value, sizeof(response->audio_channels));
-        }
-    }
-    value = NULL;
-    if (esp_http_client_get_header(client, "X-Audio-Version", &value) == ESP_OK && value != NULL) {
-        strlcpy(response->audio_version, value, sizeof(response->audio_version));
-    } else {
-        value = NULL;
-        if (esp_http_client_get_header(client, "X-Prompt-Version", &value) == ESP_OK && value != NULL) {
-            strlcpy(response->audio_version, value, sizeof(response->audio_version));
-        }
-    }
-    value = NULL;
-    if (esp_http_client_get_header(client, "X-Voice-Config-Hash", &value) == ESP_OK && value != NULL) {
-        strlcpy(response->voice_config_hash, value, sizeof(response->voice_config_hash));
-    }
 }
 
 static esp_err_t server_comm_set_common_headers(esp_http_client_handle_t client,
@@ -529,13 +574,17 @@ static esp_err_t server_comm_perform(esp_http_client_method_t method,
         .overflow = false,
     };
     server_comm_reset_response(response);
+    server_comm_event_ctx_t event_ctx = {
+        .body_ctx = &body_ctx,
+        .response = response,
+    };
 
     esp_http_client_config_t config = {
         .url = url,
         .method = method,
         .timeout_ms = timeout_ms > 0 ? (int)timeout_ms : (int)server_comm_get_default_timeout_ms(),
         .event_handler = server_comm_body_event_handler,
-        .user_data = &body_ctx,
+        .user_data = &event_ctx,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -555,7 +604,7 @@ static esp_err_t server_comm_perform(esp_http_client_method_t method,
         ret = esp_http_client_perform(client);
     }
 
-    server_comm_capture_response_info(client, &body_ctx, response);
+    server_comm_capture_response_info(client, &body_ctx, response, response);
     int status = response != NULL ? response->status_code : esp_http_client_get_status_code(client);
     ESP_LOGD(TAG,
              "http response status=%d content_length=%lld body_len=%u overflow=%d",
@@ -755,6 +804,8 @@ esp_err_t server_comm_http_post_raw_stream_begin(const server_comm_raw_stream_co
         .buffer_size = config->buffer_size > 0 ? config->buffer_size :
                                                   (int)SERVER_COMM_HTTP_READ_CHUNK_BYTES,
         .buffer_size_tx = config->tx_buffer_size > 0 ? config->tx_buffer_size : 512,
+        .event_handler = server_comm_body_event_handler,
+        .user_data = &stream->event_ctx,
     };
 
     stream->client = esp_http_client_init(&http_config);
@@ -876,6 +927,8 @@ esp_err_t server_comm_http_post_raw_fixed_stream_begin(const server_comm_raw_str
         .buffer_size = config->buffer_size > 0 ? config->buffer_size :
                                                   (int)SERVER_COMM_HTTP_READ_CHUNK_BYTES,
         .buffer_size_tx = config->tx_buffer_size > 0 ? config->tx_buffer_size : 512,
+        .event_handler = server_comm_body_event_handler,
+        .user_data = &stream->event_ctx,
     };
 
     stream->client = esp_http_client_init(&http_config);
@@ -964,6 +1017,8 @@ esp_err_t server_comm_http_get_raw_stream_begin(const server_comm_raw_stream_con
         .buffer_size = config->buffer_size > 0 ? config->buffer_size :
                                                   (int)SERVER_COMM_HTTP_READ_CHUNK_BYTES,
         .buffer_size_tx = config->tx_buffer_size > 0 ? config->tx_buffer_size : 256,
+        .event_handler = server_comm_body_event_handler,
+        .user_data = &stream->event_ctx,
     };
 
     stream->client = esp_http_client_init(&http_config);
@@ -1083,7 +1138,10 @@ esp_err_t server_comm_http_fetch_headers(server_comm_raw_stream_t *stream,
     }
 
     stream->headers_fetched = true;
-    server_comm_capture_response_info(stream->client, NULL, response);
+    server_comm_capture_response_info(stream->client,
+                                      NULL,
+                                      &stream->response_headers,
+                                      response);
     gateway_link_record_http_result(ESP_OK,
                                     server_comm_voice_request_is_active_for_current_task(),
                                     server_comm_request_is_reconnect_for_current_task());

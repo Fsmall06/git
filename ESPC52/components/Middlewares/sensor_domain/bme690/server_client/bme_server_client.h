@@ -5,8 +5,7 @@
  * @file bme_server_client.h
  * @brief C5 终端 BME690 本地网关上报接口。
  *
- * 本模块只发送 C5 -> S3 统一设备流；sensor_id 写入 lid，整机 did 由
- * device_stream_client 使用本机配置填充。
+ * 本模块只发送 C5 -> S3 本地 sensor envelope；S3 负责解析并转发到 Server。
  */
 
 #include "bme690.h"
@@ -18,9 +17,9 @@
 extern "C" {
 #endif
 
-/* BME690 本地网关上传配置：C5 正式模式只向 ESPS3 统一 stream 上报。 */
+/* BME690 本地网关上传配置：C5 正式模式只向 ESPS3 local sensor 上报。 */
 #ifndef BME_SERVER_CLIENT_ENDPOINT
-#define BME_SERVER_CLIENT_ENDPOINT ESP111_PROTOCOL_ROUTE_DEVICE_STREAM
+#define BME_SERVER_CLIENT_ENDPOINT ESP111_PROTOCOL_ROUTE_SENSOR
 #endif
 
 #ifndef BME_SERVER_CLIENT_TIMEOUT_MS
@@ -28,7 +27,7 @@ extern "C" {
 #endif
 
 #ifndef BME_SERVER_CLIENT_JSON_BUFFER_SIZE
-#define BME_SERVER_CLIENT_JSON_BUFFER_SIZE ESP111_PROTOCOL_DEVICE_STREAM_MAX_BYTES
+#define BME_SERVER_CLIENT_JSON_BUFFER_SIZE 1024U
 #endif
 
 /** @brief 初始化 BME 上报客户端；BME service 启动时调用，当前无状态，可重复调用。 */
@@ -37,7 +36,7 @@ esp_err_t bme_server_client_init(void);
 /**
  * @brief 上传一次 BME690 读数到 S3。
  *
- * 调用位置：bme_sensor_task() 每轮读数和空气质量计算成功后。
+ * 调用位置：bme_sensor_service_tick() 每轮读数和空气质量计算成功后。
  * @param sensor_id BME sensor_id，不能为空；写入统一 stream 的 lid 字段。
  * @param data bme690_read() 输出，不能为空。
  * @param air_quality bme_air_quality_update() 输出，不能为空。

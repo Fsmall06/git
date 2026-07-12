@@ -21,7 +21,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "device_protocol_metadata.h"
-#include "device_stream_client.h"
 #include "esp111_protocol_common.h"
 #include "screen_service.h"
 #include "server_comm_config.h"
@@ -31,8 +30,8 @@
 static const char *TAG = "system_server_client";
 
 #define SYSTEM_COMMAND_REGISTER_ENDPOINT ESP111_PROTOCOL_ROUTE_REGISTER
-#define SYSTEM_COMMAND_HEARTBEAT_ENDPOINT ESP111_PROTOCOL_ROUTE_HEALTH
-#define SYSTEM_COMMAND_STATUS_ENDPOINT ESP111_PROTOCOL_ROUTE_HEALTH
+#define SYSTEM_COMMAND_HEARTBEAT_ENDPOINT ESP111_PROTOCOL_ROUTE_HEARTBEAT
+#define SYSTEM_COMMAND_STATUS_ENDPOINT ESP111_PROTOCOL_ROUTE_STATUS
 #define SYSTEM_COMMAND_PENDING_ENDPOINT ESP111_PROTOCOL_ROUTE_COMMANDS_PENDING
 #define SYSTEM_COMMAND_ACK_ENDPOINT_PREFIX ESP111_PROTOCOL_ROUTE_COMMANDS_PREFIX
 #define SYSTEM_COMMAND_ACK_ENDPOINT_SUFFIX ESP111_PROTOCOL_ROUTE_COMMAND_ACK_SUFFIX
@@ -796,28 +795,64 @@ esp_err_t system_server_client_init(void)
     return ret;
 }
 
-esp_err_t system_server_client_send_heartbeat(const char *device_id)
+static esp_err_t system_server_client_post_health_update(const char *endpoint,
+                                                         const char *device_id,
+                                                         unsigned int subtype)
 {
+    if (endpoint == NULL || endpoint[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     const char *target_device_id =
         (device_id != NULL && device_id[0] != '\0') ? device_id : server_comm_get_device_id();
-    (void)target_device_id;
-    return device_stream_client_publish(ESP111_PROTOCOL_DEVICE_STREAM_TYPE_STATUS,
-                                        "S3",
-                                        (double)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-                                        (double)esp_timer_get_time() / 1000.0,
-                                        (double)system_server_client_read_rssi_value());
+    const char *message_type = subtype == ESP111_PROTOCOL_LOCAL_HEALTH_STATUS ?
+                                   ESP111_PROTOCOL_MSG_STATUS :
+                                   ESP111_PROTOCOL_MSG_HEARTBEAT;
+
+    system_server_client_scratch_t *scratch = NULL;
+    esp_err_t ret = system_server_client_take_scratch(&scratch);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    device_protocol_metadata_t metadata = {0};
+    device_protocol_prepare_metadata(&metadata, message_type);
+    ret = system_server_client_build_health_json(scratch, &metadata, subtype);
+    if (ret == ESP_OK) {
+        server_comm_http_response_t response = {0};
+        ret = server_comm_http_post_json_with_headers(endpoint,
+                                                      scratch->json_body,
+                                                      metadata.headers,
+                                                      metadata.header_count,
+                                                      SYSTEM_COMMAND_HTTP_TIMEOUT_MS,
+                                                      NULL,
+                                                      0,
+                                                      &response);
+        if (ret == ESP_OK) {
+            ESP_LOGD(TAG,
+                     "local %s sent device_id=%s status=%d",
+                     message_type,
+                     target_device_id,
+                     response.status_code);
+        }
+    }
+
+    system_server_client_give_scratch();
+    return ret;
+}
+
+esp_err_t system_server_client_send_heartbeat(const char *device_id)
+{
+    return system_server_client_post_health_update(SYSTEM_COMMAND_HEARTBEAT_ENDPOINT,
+                                                   device_id,
+                                                   ESP111_PROTOCOL_LOCAL_HEALTH_HEARTBEAT);
 }
 
 esp_err_t system_server_client_send_status(const char *device_id)
 {
-    const char *target_device_id =
-        (device_id != NULL && device_id[0] != '\0') ? device_id : server_comm_get_device_id();
-    (void)target_device_id;
-    return device_stream_client_publish(ESP111_PROTOCOL_DEVICE_STREAM_TYPE_STATUS,
-                                        "S3",
-                                        (double)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-                                        (double)esp_timer_get_time() / 1000.0,
-                                        (double)system_server_client_read_rssi_value());
+    return system_server_client_post_health_update(SYSTEM_COMMAND_STATUS_ENDPOINT,
+                                                   device_id,
+                                                   ESP111_PROTOCOL_LOCAL_HEALTH_STATUS);
 }
 
 esp_err_t system_server_client_poll_commands(const char *device_id)

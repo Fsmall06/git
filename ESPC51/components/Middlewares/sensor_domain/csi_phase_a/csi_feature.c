@@ -408,7 +408,7 @@ void csi_feature_default_config(csi_feature_config_t *config)
 
     config->calibration_duration_ms = 7000U;
     config->calibration_converged_ms = 2000U;
-    config->min_calibration_samples = 24U;
+    config->min_calibration_samples = 50U;
     config->calibration_variance_epsilon = 0.75f;
     config->ewma_alpha = 0.25f;
     config->guard_subcarriers = 2U;
@@ -436,6 +436,9 @@ void csi_feature_processor_init(csi_feature_processor_t *processor,
     }
     if (processor->config.calibration_duration_ms > 10000U) {
         processor->config.calibration_duration_ms = 10000U;
+    }
+    if (processor->config.min_calibration_samples < 50U) {
+        processor->config.min_calibration_samples = 50U;
     }
     if (processor->config.calibration_converged_ms < 500U) {
         processor->config.calibration_converged_ms = default_config.calibration_converged_ms;
@@ -472,6 +475,8 @@ bool csi_feature_processor_push(csi_feature_processor_t *processor,
     out_feature->metrics.cv = 0.0f;
     out_feature->metrics.quality = 0.0f;
     out_feature->state_hint = ENVELOPE_STATE_HINT_IDLE;
+    out_feature->motion_score = 0.0f;
+    out_feature->confidence = 0.0f;
     out_feature->quality_state = CSI_SAMPLE_QUALITY_INVALID;
 
     if (processor->state == CSI_PROCESSOR_STATE_INIT) {
@@ -486,9 +491,11 @@ bool csi_feature_processor_push(csi_feature_processor_t *processor,
         uint64_t elapsed = frame->timestamp_ms >= processor->calibration_started_ms
                                ? frame->timestamp_ms - processor->calibration_started_ms
                                : 0U;
-        (void)elapsed;
         bool converged = calibration_variance_converged(processor, frame->timestamp_ms);
-        if (converged) {
+        bool duration_ready = elapsed >= processor->config.calibration_duration_ms;
+        bool samples_ready =
+            processor->calibration_samples >= processor->config.min_calibration_samples;
+        if (duration_ready && samples_ready && converged) {
             finish_calibration(processor);
         }
         return false;

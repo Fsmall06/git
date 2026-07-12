@@ -97,6 +97,7 @@ typedef struct {
     gateway_link_voice_abort_cb_t voice_abort_cb;
     uint32_t consecutive_failures;
     uint32_t reconnect_failures;
+    int64_t last_skip_log_ms;
     int64_t last_voice_skip_log_ms;
     TickType_t wifi_got_ip_tick;
     TickType_t wifi_down_tick;
@@ -247,6 +248,7 @@ void gateway_link_notify_wifi_down(void)
     s_link.wifi_got_ip_tick = 0;
     s_link.wifi_down_tick = xTaskGetTickCount();
     portEXIT_CRITICAL(&s_link_lock);
+    gateway_link_set_state(LINK_DOWN, "wifi_down");
     gateway_link_request_reconnect();
 }
 
@@ -257,6 +259,7 @@ void gateway_link_notify_wifi_got_ip(void)
     s_link.wifi_got_ip_tick = xTaskGetTickCount();
     s_link.wifi_down_tick = 0;
     portEXIT_CRITICAL(&s_link_lock);
+    gateway_link_set_state(LINK_WIFI_CONNECTED, "wifi_got_ip");
     gateway_link_request_reconnect();
 }
 
@@ -314,6 +317,21 @@ static bool gateway_link_should_log(int64_t *last_log_ms)
     portEXIT_CRITICAL(&s_link_lock);
 
     return should_log;
+}
+
+bool gateway_link_can_run_non_voice_task(const char *task_name)
+{
+    if (gateway_link_is_ready()) {
+        return true;
+    }
+
+    if (gateway_link_should_log(&s_link.last_skip_log_ms)) {
+        ESP_LOGI(TAG,
+                 "gateway link down, reconnecting, skip non-voice task%s%s",
+                 task_name != NULL && task_name[0] != '\0' ? ": " : "",
+                 task_name != NULL && task_name[0] != '\0' ? task_name : "");
+    }
+    return false;
 }
 
 bool gateway_link_can_start_voice_turn(void)

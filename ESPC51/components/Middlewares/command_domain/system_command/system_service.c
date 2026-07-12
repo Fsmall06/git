@@ -3,8 +3,8 @@
  * @brief C5 终端 register/heartbeat/status/command 后台服务。
  *
  * 本文件属于 ESP32-C5 终端（ESPC51/ESPC52 共用），由 app_orchestrator_start()
- * 启动，负责初始化 display placeholder 和 system_server_client，并向 C5 scheduler
- * 暴露 heartbeat/status/commands tick。它不执行 WiFi 连接、不读取 BME、不处理
+ * 启动，负责初始化 display placeholder 和 system_server_client，并向 C5 system
+ * worker 暴露 heartbeat/status/commands tick。它不执行 WiFi 连接、不读取 BME、不处理
  * voice PCM，也不改变 S3 下发命令的协议字段。
  */
 
@@ -115,7 +115,7 @@ esp_err_t system_service_init(void)
     }
 
     ESP_LOGI(TAG,
-             "system service registered with C5 scheduler heartbeat_ms=%u status_ms=%u command_poll_ms=%u",
+             "system service registered with C5 event worker heartbeat_ms=%u status_ms=%u command_poll_ms=%u",
              (unsigned int)SYSTEM_SERVICE_HEARTBEAT_INTERVAL_MS,
              (unsigned int)SYSTEM_SERVICE_STATUS_INTERVAL_MS,
              (unsigned int)SYSTEM_SERVICE_COMMAND_POLL_INTERVAL_MS);

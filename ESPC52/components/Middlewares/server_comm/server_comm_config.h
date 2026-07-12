@@ -37,7 +37,7 @@ extern "C" {
 #endif
 
 #ifndef SERVER_COMM_DEVICE_ID
-#define SERVER_COMM_DEVICE_ID "sensair_shuttle_01"
+#define SERVER_COMM_DEVICE_ID "sensair_shuttle_02"
 #endif
 
 #ifndef SERVER_COMM_DEFAULT_TIMEOUT_MS

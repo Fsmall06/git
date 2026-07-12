@@ -648,8 +648,37 @@ esp_err_t wake_prompt_cache_gateway_handle_http(httpd_req_t *req)
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"wake_prompt_unavailable\"}");
     }
 
+    struct stat file_stat = {0};
+    if (stat(WAKE_PROMPT_PCM_PATH, &file_stat) != 0 || file_stat.st_size <= 0 ||
+        (size_t)file_stat.st_size > WAKE_PROMPT_MAX_PCM_BYTES) {
+        ESP_LOGW(TAG, "wake prompt cache invalid before stream");
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"wake_prompt_cache_missing\"}");
+    }
+
     FILE *file = fopen(WAKE_PROMPT_PCM_PATH, "rb");
     if (file == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"wake_prompt_cache_missing\"}");
+    }
+
+    uint8_t *buf = heap_caps_malloc(WAKE_PROMPT_READ_BYTES, MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        fclose(file);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"wake_prompt_no_memory\"}");
+    }
+
+    size_t first_chunk_size = fread(buf, 1, WAKE_PROMPT_READ_BYTES, file);
+    if (first_chunk_size == 0 || ferror(file)) {
+        ESP_LOGW(TAG,
+                 "wake prompt cache unreadable before stream first_chunk_size=%u read_error=%d",
+                 (unsigned int)first_chunk_size,
+                 ferror(file) ? 1 : 0);
+        heap_caps_free(buf);
+        fclose(file);
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"wake_prompt_cache_missing\"}");
@@ -662,15 +691,20 @@ esp_err_t wake_prompt_cache_gateway_handle_http(httpd_req_t *req)
     httpd_resp_set_hdr(req, "X-Audio-Version", meta.prompt_version);
     httpd_resp_set_hdr(req, "X-Voice-Config-Hash", meta.voice_config_hash);
 
-    uint8_t *buf = heap_caps_malloc(WAKE_PROMPT_READ_BYTES, MALLOC_CAP_8BIT);
-    if (buf == NULL) {
-        fclose(file);
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"wake_prompt_no_memory\"}");
-    }
-
     size_t sent = 0;
-    while (true) {
+    size_t chunks = 0;
+    ESP_LOGI(TAG,
+             "WAKE_PROMPT_STREAM_START file_size=%u first_chunk_size=%u content_type=%s",
+             (unsigned int)file_stat.st_size,
+             (unsigned int)first_chunk_size,
+             WAKE_PROMPT_CONTENT_TYPE);
+
+    ret = httpd_resp_send_chunk(req, (const char *)buf, first_chunk_size);
+    if (ret == ESP_OK) {
+        sent += first_chunk_size;
+        chunks++;
+    }
+    while (ret == ESP_OK) {
         size_t got = fread(buf, 1, WAKE_PROMPT_READ_BYTES, file);
         if (got > 0) {
             ret = httpd_resp_send_chunk(req, (const char *)buf, got);
@@ -678,6 +712,7 @@ esp_err_t wake_prompt_cache_gateway_handle_http(httpd_req_t *req)
                 break;
             }
             sent += got;
+            chunks++;
         }
         if (got < WAKE_PROMPT_READ_BYTES) {
             if (ferror(file)) {
@@ -693,10 +728,8 @@ esp_err_t wake_prompt_cache_gateway_handle_http(httpd_req_t *req)
         ret = httpd_resp_send_chunk(req, NULL, 0);
     }
     ESP_LOGI(TAG,
-             "wake prompt streamed to C5 ret=%s bytes=%u hash=%s version=%s",
-             esp_err_to_name(ret),
+             "WAKE_PROMPT_STREAM_END sent_bytes=%u chunks=%u",
              (unsigned int)sent,
-             meta.voice_config_hash,
-             meta.prompt_version);
+             (unsigned int)chunks);
     return ret;
 }

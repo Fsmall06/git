@@ -5,7 +5,7 @@
  * @file bme_sensor_service.h
  * @brief C5 终端 BME690 后台服务接口。
  *
- * app_orchestrator_start() 在 WiFi/系统服务后注册本模块；C5 scheduler 驱动单次
+ * app_orchestrator_start() 在 WiFi/系统服务后注册本模块；C5 BME worker 驱动单次
  * tick，voice_chain 在语音 turn 前后通过 pause/wait_paused/resume 协调网络和 heap。
  * BME_SENSOR_DEVICE_ID 是传感模块
  * sensor_id，不是整机 device_id。
@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #ifndef BME_SENSOR_READ_UPLOAD_PERIOD_MS
-#define BME_SENSOR_READ_UPLOAD_PERIOD_MS 2000U // 读取并上传的周期，单位 ms。
+#define BME_SENSOR_READ_UPLOAD_PERIOD_MS 5000U // 读取并上传的周期，单位 ms。
 #endif
 
 #ifndef BME_SENSOR_PAUSED_DELAY_MS
@@ -41,7 +41,7 @@ extern "C" {
 #endif
 
 /**
- * @brief 注册 BME690 scheduler 驱动读取/上传服务。
+ * @brief 注册 BME690 event-worker 驱动读取/上传服务。
  *
  * 调用位置：app_orchestrator_start()。
  * 调用时机：WiFi 稳定、system_service 初始化后调用一次；重复调用不会重复创建任务。
@@ -52,7 +52,7 @@ extern "C" {
 esp_err_t bme_sensor_service_start(void);
 
 /**
- * @brief Scheduler 调用：执行一次 BME690 read/quality/update/upload。
+ * @brief BME worker 调用：执行一次 BME690 read/quality/update/upload。
  *
  * 调用前和函数内部都会经过 c5_should_run(C5_TASK_TYPE_BME_SENSOR) gate；函数不做
  * 固定周期 delay，也不创建独立 service loop。

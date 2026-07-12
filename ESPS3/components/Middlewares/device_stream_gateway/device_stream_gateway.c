@@ -3,9 +3,9 @@
  * @brief S3 侧 C5 扁平 device stream ingress。
  *
  * 本文件属于 ESPS3 网关，负责接收 C5 的 UDP/HTTP 短字段 stream frame，并交给
- * scheduler stream worker 解析。它只接受固定 7 字段对象，维护每个 device_id
- * 的单调 timestamp，拒绝 raw CSI/subcarrier 风格 payload；CSI v2 envelope 主路径
- * 不在这里解析。
+ * scheduler stream worker 解析并重新入 S3 event bus。它只接受固定 7 字段对象，
+ * 维护每个 device_id 的单调 timestamp，拒绝 raw CSI/subcarrier 风格 payload；
+ * CSI v2 envelope 主路径不在这里解析。
  */
 
 #include "device_stream_gateway.h"
@@ -17,27 +17,25 @@
 
 #include "cJSON.h"
 #include "app_stack_monitor.h"
-#include "child_registry.h"
-#include "csi_fusion.h"
-#include "csi_placeholder_gateway.h"
 #include "esp111_protocol_common.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "gateway_config.h"
 #include "gateway_wifi.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "resource_manager.h"
 #include "s3_scheduler.h"
-#include "sensor_aggregator.h"
 
 static const char *TAG = "device_stream_gateway";
 
 #ifndef DEVICE_STREAM_UDP_TASK_STACK
-#define DEVICE_STREAM_UDP_TASK_STACK 6144U
+#define DEVICE_STREAM_UDP_TASK_STACK 8192U
 #endif
 
 #ifndef DEVICE_STREAM_UDP_TASK_PRIORITY
@@ -52,9 +50,22 @@ static const char *TAG = "device_stream_gateway";
 #define DEVICE_STREAM_REJECT_LOG_INTERVAL_MS 10000U
 #endif
 
+#ifndef DEVICE_STREAM_RECONNECT_GAP_MS
+#define DEVICE_STREAM_RECONNECT_GAP_MS 5000U
+#endif
+
+#ifndef DEVICE_STREAM_REBOOT_SMALL_TS_MS
+#define DEVICE_STREAM_REBOOT_SMALL_TS_MS 60000U
+#endif
+
+#define DEVICE_STREAM_CLOCK_COUNT (sizeof(s_clocks) / sizeof(s_clocks[0]))
+
 typedef struct {
     char device_id[48];
+    char type[12];
     int64_t last_t_ms;
+    int64_t last_valid_wall_ms;
+    char peer_ip[16];
 } stream_clock_t;
 
 typedef struct {
@@ -69,15 +80,21 @@ typedef struct {
 
 static TaskHandle_t s_udp_task;
 static SemaphoreHandle_t s_clock_lock;
-static stream_clock_t s_clocks[GATEWAY_CONFIG_MAX_CHILDREN];
+static stream_clock_t s_clocks[GATEWAY_CONFIG_MAX_CHILDREN * 4U];
 static uint32_t s_net_not_ready_drop_count;
 static uint32_t s_queue_overflow_drop_count;
 static uint32_t s_stream_reject_count;
+static uint32_t s_udp_enqueue_fail_count;
+static uint32_t s_udp_invalid_state_suppressed_count;
 static int64_t s_last_stats_log_ms;
 static int64_t s_last_reject_log_ms;
+static int64_t s_last_udp_enqueue_log_ms;
 static int64_t s_last_csi_deprecated_log_ms;
 static int64_t s_last_stack_log_ms;
 static int64_t s_last_heap_log_ms;
+static char s_last_reject_device_id[48];
+static size_t s_last_reject_len;
+static esp_err_t s_last_reject_ret;
 static volatile bool s_stream_running;
 
 /* stream ingress 使用 S3 本机 uptime 做日志节流和 net gate 等待，不参与业务 timestamp。 */
@@ -109,16 +126,26 @@ static void log_stream_stats(const char *reason, bool force)
              reason != NULL ? reason : "periodic");
 }
 
-static void record_stream_reject(const char *reason, size_t len, esp_err_t ret)
+static void record_stream_reject_for_device(const char *reason,
+                                            size_t len,
+                                            esp_err_t ret,
+                                            const char *device_id)
 {
     ++s_stream_reject_count;
+    s_last_reject_len = len;
+    s_last_reject_ret = ret;
+    strlcpy(s_last_reject_device_id,
+            device_id != NULL && device_id[0] != '\0' ? device_id : "-",
+            sizeof(s_last_reject_device_id));
+
     const int64_t timestamp_ms = now_ms();
     if (s_last_reject_log_ms == 0 ||
         timestamp_ms - s_last_reject_log_ms >= DEVICE_STREAM_REJECT_LOG_INTERVAL_MS) {
         s_last_reject_log_ms = timestamp_ms;
         ESP_LOGW(TAG,
-                 "stream reject summary reason=%s count=%lu last_len=%u ret=%s depth=%u",
+                 "stream reject summary reason=%s device_id=%s count=%lu last_len=%u ret=%s depth=%u",
                  reason != NULL ? reason : "unknown",
+                 device_id != NULL && device_id[0] != '\0' ? device_id : "-",
                  (unsigned long)s_stream_reject_count,
                  (unsigned int)len,
                  esp_err_to_name(ret),
@@ -127,11 +154,17 @@ static void record_stream_reject(const char *reason, size_t len, esp_err_t ret)
     }
 
     ESP_LOGD(TAG,
-             "stream reject reason=%s count=%lu len=%u ret=%s",
+             "stream reject reason=%s device_id=%s count=%lu len=%u ret=%s",
              reason != NULL ? reason : "unknown",
+             device_id != NULL && device_id[0] != '\0' ? device_id : "-",
              (unsigned long)s_stream_reject_count,
              (unsigned int)len,
              esp_err_to_name(ret));
+}
+
+static void record_stream_reject(const char *reason, size_t len, esp_err_t ret)
+{
+    record_stream_reject_for_device(reason, len, ret, NULL);
 }
 
 static void record_net_not_ready_drop(const char *source)
@@ -143,6 +176,37 @@ static void record_net_not_ready_drop(const char *source)
              (unsigned int)stream_queue_depth(),
              source != NULL ? source : "unknown");
     log_stream_stats(source, false);
+}
+
+static void reset_stream_runtime(const char *reason)
+{
+    device_stream_gateway_reset_timestamp_baseline(NULL, reason);
+    s3_scheduler_reset_stream_queue(reason);
+}
+
+static void log_udp_enqueue_failed(esp_err_t ret, size_t len, const char *peer_ip)
+{
+    ++s_udp_enqueue_fail_count;
+    if (ret == ESP_ERR_INVALID_STATE) {
+        ++s_udp_invalid_state_suppressed_count;
+    }
+
+    const int64_t timestamp_ms = now_ms();
+    if (s_last_udp_enqueue_log_ms != 0 &&
+        timestamp_ms - s_last_udp_enqueue_log_ms < DEVICE_STREAM_REJECT_LOG_INTERVAL_MS) {
+        return;
+    }
+    s_last_udp_enqueue_log_ms = timestamp_ms;
+
+    ESP_LOGW(TAG,
+             "stream UDP enqueue failed summary count=%lu invalid_state_count=%lu device_id=%s peer_ip=%s last_len=%u ret=%s depth=%u",
+             (unsigned long)s_udp_enqueue_fail_count,
+             (unsigned long)s_udp_invalid_state_suppressed_count,
+             s_last_reject_device_id[0] != '\0' ? s_last_reject_device_id : "-",
+             peer_ip != NULL && peer_ip[0] != '\0' ? peer_ip : "-",
+             (unsigned int)(s_last_reject_len != 0U ? s_last_reject_len : len),
+             esp_err_to_name(s_last_reject_ret != ESP_OK ? s_last_reject_ret : ret),
+             (unsigned int)stream_queue_depth());
 }
 
 static void wait_until_net_ready(const char *task_name, bool wdt_registered)
@@ -274,95 +338,196 @@ static bool parse_frame(const char *json, device_stream_frame_t *out)
     return ok;
 }
 
-static bool timestamp_is_monotonic(const device_stream_frame_t *frame)
+static bool peer_ip_changed(const stream_clock_t *slot, const char *peer_ip)
+{
+    return slot != NULL && slot->peer_ip[0] != '\0' &&
+           peer_ip != NULL && peer_ip[0] != '\0' &&
+           strcmp(slot->peer_ip, peer_ip) != 0;
+}
+
+static const char *timestamp_reset_reason(const stream_clock_t *slot,
+                                          const device_stream_frame_t *frame,
+                                          const char *peer_ip,
+                                          int64_t wall_ms)
+{
+    if (slot == NULL || frame == NULL || frame->timestamp_ms >= slot->last_t_ms) {
+        return NULL;
+    }
+    if (peer_ip_changed(slot, peer_ip)) {
+        return "peer_ip_changed";
+    }
+    if (frame->timestamp_ms < (int64_t)DEVICE_STREAM_REBOOT_SMALL_TS_MS &&
+        slot->last_t_ms > (int64_t)DEVICE_STREAM_REBOOT_SMALL_TS_MS) {
+        return "child_reboot_timestamp";
+    }
+    if (slot->last_valid_wall_ms > 0 &&
+        wall_ms - slot->last_valid_wall_ms > (int64_t)DEVICE_STREAM_RECONNECT_GAP_MS) {
+        return "stream_gap";
+    }
+    return NULL;
+}
+
+static bool timestamp_is_monotonic(const device_stream_frame_t *frame,
+                                   const char *peer_ip,
+                                   size_t len)
 {
     if (frame == NULL || frame->timestamp_ms <= 0) {
         return false;
     }
+
+    const int64_t wall_ms = now_ms();
+    bool ok = false;
+    bool table_full = false;
+    bool accepted_reset = false;
+    int64_t old_child_ts = 0;
+    const char *reset_reason = NULL;
+
     if (s_clock_lock != NULL) {
         xSemaphoreTake(s_clock_lock, portMAX_DELAY);
     }
 
     stream_clock_t *slot = NULL;
-    for (size_t i = 0; i < GATEWAY_CONFIG_MAX_CHILDREN; ++i) {
+    for (size_t i = 0; i < DEVICE_STREAM_CLOCK_COUNT; ++i) {
         if (s_clocks[i].device_id[0] == '\0') {
             if (slot == NULL) {
                 slot = &s_clocks[i];
             }
             continue;
         }
-        if (strcmp(s_clocks[i].device_id, frame->device_id) == 0) {
+        if (strcmp(s_clocks[i].device_id, frame->device_id) == 0 &&
+            strcmp(s_clocks[i].type, frame->type) == 0) {
             slot = &s_clocks[i];
             break;
         }
     }
 
-    bool ok = false;
     if (slot != NULL) {
         if (slot->device_id[0] == '\0') {
             strlcpy(slot->device_id, frame->device_id, sizeof(slot->device_id));
+            strlcpy(slot->type, frame->type, sizeof(slot->type));
         }
-        /* 每个 C5 单独单调化；C51/C52 之间不互相压制。 */
+        old_child_ts = slot->last_t_ms;
         ok = frame->timestamp_ms > slot->last_t_ms;
+        if (!ok) {
+            reset_reason = timestamp_reset_reason(slot, frame, peer_ip, wall_ms);
+            ok = reset_reason != NULL;
+            accepted_reset = ok;
+        }
         if (ok) {
             slot->last_t_ms = frame->timestamp_ms;
+            slot->last_valid_wall_ms = wall_ms;
+            if (peer_ip != NULL && peer_ip[0] != '\0') {
+                strlcpy(slot->peer_ip, peer_ip, sizeof(slot->peer_ip));
+            }
         }
+    } else {
+        table_full = true;
     }
 
     if (s_clock_lock != NULL) {
         xSemaphoreGive(s_clock_lock);
     }
-    if (slot == NULL) {
-        record_stream_reject("clock_table_full", 0U, ESP_ERR_NO_MEM);
+    if (table_full) {
+        record_stream_reject_for_device("clock_table_full",
+                                        len,
+                                        ESP_ERR_NO_MEM,
+                                        frame->device_id);
         ESP_LOGD(TAG,
-                 "stream clock table full device_id=%s max_children=%u",
+                 "stream clock table full device_id=%s type=%s max_entries=%u",
                  frame->device_id,
-                 (unsigned int)GATEWAY_CONFIG_MAX_CHILDREN);
-    } else if (!ok) {
-        record_stream_reject("timestamp_non_monotonic", 0U, ESP_ERR_INVALID_STATE);
-        ESP_LOGD(TAG,
-                 "stream timestamp rejected device_id=%s timestamp=%lld last=%lld",
+                 frame->type,
+                 (unsigned int)DEVICE_STREAM_CLOCK_COUNT);
+    } else if (accepted_reset) {
+        ESP_LOGI(TAG,
+                 "stream timestamp baseline accepted reset device_id=%s type=%s old_child_ts=%lld new_child_ts=%lld reason=%s",
                  frame->device_id,
+                 frame->type,
+                 (long long)old_child_ts,
                  (long long)frame->timestamp_ms,
-                 (long long)slot->last_t_ms);
+                 reset_reason != NULL ? reset_reason : "unknown");
+    } else if (!ok) {
+        record_stream_reject_for_device("timestamp_non_monotonic",
+                                        len,
+                                        ESP_ERR_INVALID_STATE,
+                                        frame->device_id);
+        ESP_LOGD(TAG,
+                 "stream timestamp rejected device_id=%s type=%s timestamp=%lld last=%lld",
+                 frame->device_id,
+                 frame->type,
+                 (long long)frame->timestamp_ms,
+                 (long long)old_child_ts);
     }
     return ok;
 }
 
-static esp_err_t handle_csi_frame(const device_stream_frame_t *frame)
+static s3_runtime_msg_kind_t kind_from_frame_type(const char *type)
 {
-    log_deprecated_csi_stream(frame);
-    return ESP_OK;
+    if (type == NULL) {
+        return S3_RUNTIME_MSG_UNKNOWN;
+    }
+    if (strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_CSI) == 0) {
+        return S3_RUNTIME_MSG_CSI;
+    }
+    if (strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_SENSOR) == 0) {
+        return S3_RUNTIME_MSG_SENSOR;
+    }
+    if (strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_STATUS) == 0) {
+        return S3_RUNTIME_MSG_STATUS;
+    }
+    if (strcmp(type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_EVENT) == 0) {
+        return S3_RUNTIME_MSG_EVENT;
+    }
+    return S3_RUNTIME_MSG_UNKNOWN;
 }
 
-static esp_err_t handle_sensor_frame(const device_stream_frame_t *frame)
+static esp_err_t enqueue_frame_event(const device_stream_frame_t *frame,
+                                     const char *peer_ip,
+                                     int64_t received_at_us)
 {
-    sensor_aggregator_result_t result = {0};
-    return sensor_aggregator_handle_stream_sensor(frame->device_id,
-                                                  frame->timestamp_ms,
-                                                  frame->link_id,
-                                                  frame->v1,
-                                                  frame->v2,
-                                                  frame->v3,
-                                                  &result);
+    if (frame == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s3_runtime_ingress_t ingress = {
+        .kind = kind_from_frame_type(frame->type),
+        .is_stream_frame = true,
+        .rx_time_us = received_at_us > 0 ? received_at_us : esp_timer_get_time(),
+    };
+    ingress.rx_time_ms = ingress.rx_time_us / 1000;
+    if (ingress.kind == S3_RUNTIME_MSG_UNKNOWN) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    ingress.unified.t = frame->timestamp_ms;
+    strlcpy(ingress.unified.did, frame->device_id, sizeof(ingress.unified.did));
+    strlcpy(ingress.unified.type, frame->type, sizeof(ingress.unified.type));
+    strlcpy(ingress.unified.lid, frame->link_id, sizeof(ingress.unified.lid));
+    ingress.unified.v1 = (float)frame->v1;
+    ingress.unified.v2 = (float)frame->v2;
+    ingress.unified.v3 = (float)frame->v3;
+    strlcpy(ingress.device_id, frame->device_id, sizeof(ingress.device_id));
+    resource_manager_session_view_t view = {0};
+    if (resource_manager_get_session(ingress.device_id, &view)) {
+        ingress.resource_generation = view.generation;
+        ingress.resource_state_at_rx = view.state;
+        ingress.resource_state_since_ms_at_rx = view.state_since_ms;
+    }
+    if (peer_ip != NULL) {
+        strlcpy(ingress.peer_ip, peer_ip, sizeof(ingress.peer_ip));
+    }
+
+    s3_scheduler_priority_t priority =
+        ingress.kind == S3_RUNTIME_MSG_STATUS ? S3_SCHEDULER_PRIORITY_HIGH :
+                                                S3_SCHEDULER_PRIORITY_NORMAL;
+    return s3_scheduler_enqueue_ingress(&ingress, priority);
 }
 
-static esp_err_t handle_status_frame(const device_stream_frame_t *frame)
-{
-    sensor_aggregator_result_t result = {0};
-    return sensor_aggregator_handle_stream_status(frame->device_id,
-                                                  frame->timestamp_ms,
-                                                  frame->v1,
-                                                  frame->v2,
-                                                  frame->v3,
-                                                  &result);
-}
-
-esp_err_t device_stream_gateway_process_json(const char *json,
-                                             size_t json_len,
-                                             const char *peer_ip)
+static esp_err_t process_json_at_us(const char *json,
+                                    size_t json_len,
+                                    const char *peer_ip,
+                                    int64_t received_at_us)
 {
     if (!s_stream_running || !gateway_wifi_is_net_ready()) {
+        reset_stream_runtime("stream_json_not_ready");
         record_net_not_ready_drop("stream_json");
         return ESP_ERR_INVALID_STATE;
     }
@@ -397,35 +562,39 @@ esp_err_t device_stream_gateway_process_json(const char *json,
         ESP_LOGD(TAG, "stream frame rejected device_id=%s reason=not_allowed", frame.device_id);
         return ESP_ERR_NOT_ALLOWED;
     }
-    if (!timestamp_is_monotonic(&frame)) {
+    if (strcmp(frame.type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_CSI) == 0) {
+        log_deprecated_csi_stream(&frame);
+        record_stream_reject("deprecated_csi_stream", json_len, ESP_ERR_NOT_SUPPORTED);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!timestamp_is_monotonic(&frame, peer_ip, json_len)) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (peer_ip != NULL && peer_ip[0] != '\0') {
-        /* peer IP 只用于后续 UDP trigger 回包；完整设备身份仍由 allowlist/device_id 控制。 */
-        (void)child_registry_update_peer_ip(frame.device_id, peer_ip);
-    }
-    (void)child_registry_touch(frame.device_id, (uint32_t)(frame.timestamp_ms & 0xffffffffU));
 
-    if (strcmp(frame.type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_CSI) == 0) {
-        return handle_csi_frame(&frame);
+    /* stream gateway 到这里为止只完成 parse/monotonic/allowlist；业务处理交给 event bus worker。 */
+    return enqueue_frame_event(&frame, peer_ip, received_at_us);
+}
+
+esp_err_t device_stream_gateway_process_json(const char *json,
+                                             size_t json_len,
+                                             const char *peer_ip)
+{
+    return process_json_at_us(json, json_len, peer_ip, esp_timer_get_time());
+}
+
+static esp_err_t enqueue_frame_at_us(const char *json,
+                                     size_t json_len,
+                                     const char *peer_ip,
+                                     const char *source,
+                                     int64_t received_at_us)
+{
+    if (json == NULL || json_len == 0U ||
+        json_len > ESP111_PROTOCOL_DEVICE_STREAM_MAX_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
     }
-    if (strcmp(frame.type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_SENSOR) == 0) {
-        return handle_sensor_frame(&frame);
-    }
-    if (strcmp(frame.type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_STATUS) == 0) {
-        return handle_status_frame(&frame);
-    }
-    if (strcmp(frame.type, ESP111_PROTOCOL_DEVICE_STREAM_TYPE_EVENT) == 0) {
-        ESP_LOGD(TAG,
-                 "stream event device_id=%s link=%s v1=%.2f v2=%.2f v3=%.2f",
-                 frame.device_id,
-                 frame.link_id,
-                 frame.v1,
-                 frame.v2,
-                 frame.v3);
-        return ESP_OK;
-    }
-    return ESP_ERR_NOT_SUPPORTED;
+
+    (void)source;
+    return process_json_at_us(json, json_len, peer_ip, received_at_us);
 }
 
 esp_err_t device_stream_gateway_enqueue_frame(const char *json,
@@ -433,17 +602,13 @@ esp_err_t device_stream_gateway_enqueue_frame(const char *json,
                                               const char *peer_ip,
                                               const char *source)
 {
-    if (json == NULL || json_len == 0U ||
-        json_len > ESP111_PROTOCOL_DEVICE_STREAM_MAX_BYTES) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    /* 入口只入队；JSON parse 和 CSI/sensor/status 分发由 stream worker 完成。 */
-    esp_err_t ret = s3_scheduler_enqueue_stream_frame(json,
-                                                      json_len,
-                                                      peer_ip,
-                                                      source != NULL ? source : "stream");
-    if (ret != ESP_OK) {
+    /* 入口只做 flat stream parse/allowlist/monotonic check，再提交 typed runtime event。 */
+    esp_err_t ret = enqueue_frame_at_us(json,
+                                        json_len,
+                                        peer_ip,
+                                        source,
+                                        esp_timer_get_time());
+    if (ret == ESP_ERR_TIMEOUT || ret == ESP_ERR_NO_MEM) {
         s_queue_overflow_drop_count++;
     }
     return ret;
@@ -461,6 +626,7 @@ esp_err_t device_stream_gateway_enqueue_udp(const char *peer_ip,
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_stream_running || !gateway_wifi_is_net_ready()) {
+        reset_stream_runtime(source != NULL ? source : "stream_udp_not_ready");
         record_net_not_ready_drop(source);
         return ESP_ERR_INVALID_STATE;
     }
@@ -495,6 +661,7 @@ esp_err_t device_stream_gateway_send_udp_now(const char *peer_ip,
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_stream_running || !gateway_wifi_is_net_ready()) {
+        reset_stream_runtime(source != NULL ? source : "stream_send_not_ready");
         record_net_not_ready_drop(source);
         return ESP_ERR_INVALID_STATE;
     }
@@ -549,6 +716,7 @@ esp_err_t device_stream_gateway_send_udp_now(const char *peer_ip,
 
 esp_err_t device_stream_gateway_handle_http(httpd_req_t *req)
 {
+    const int64_t received_at_us = esp_timer_get_time();
     if (req == NULL || req->content_len <= 0 ||
         (size_t)req->content_len > ESP111_PROTOCOL_DEVICE_STREAM_MAX_BYTES) {
         return ESP_ERR_INVALID_SIZE;
@@ -582,10 +750,11 @@ esp_err_t device_stream_gateway_handle_http(httpd_req_t *req)
     }
 
     /* HTTP fallback 与 UDP 入口走同一条 scheduler stream worker 路径。 */
-    esp_err_t ret = device_stream_gateway_enqueue_frame(body,
-                                                        (size_t)req->content_len,
-                                                        peer_ip,
-                                                        "stream_http");
+    esp_err_t ret = enqueue_frame_at_us(body,
+                                        (size_t)req->content_len,
+                                        peer_ip,
+                                        "stream_http",
+                                        received_at_us);
     heap_caps_free(body);
     return ret;
 }
@@ -634,6 +803,7 @@ static void udp_task(void *arg)
             if (!s_stream_running || !gateway_wifi_is_net_ready()) {
                 close(sock);
                 ESP_LOGW(TAG, "stream UDP listener paused: net not ready");
+                reset_stream_runtime("udp_listener_paused");
                 break;
             }
             struct sockaddr_in source_addr;
@@ -663,18 +833,17 @@ static void udp_task(void *arg)
                 continue;
             }
             rx_buffer[len] = '\0';
+            const int64_t received_at_us = esp_timer_get_time();
             char peer_ip[16] = {0};
             (void)inet_ntop(AF_INET, &source_addr.sin_addr, peer_ip, sizeof(peer_ip));
-            /* UDP 收包任务不解析 JSON，只把 body 和来源 IP 交给 scheduler。 */
-            esp_err_t ret = device_stream_gateway_enqueue_frame(rx_buffer,
-                                                                (size_t)len,
-                                                                peer_ip,
-                                                                "stream_udp");
+            /* UDP 收包任务只保留串口可读的失败摘要；详细 reject 由 parser 侧聚合。 */
+            esp_err_t ret = enqueue_frame_at_us(rx_buffer,
+                                                (size_t)len,
+                                                peer_ip,
+                                                "stream_udp",
+                                                received_at_us);
             if (ret != ESP_OK) {
-                ESP_LOGW(TAG,
-                         "stream UDP enqueue failed ret=%s len=%u",
-                         esp_err_to_name(ret),
-                         (unsigned int)len);
+                log_udp_enqueue_failed(ret, (size_t)len, peer_ip);
             }
             app_stack_monitor_log_periodic(TAG,
                                            "device_stream_gateway",
@@ -706,12 +875,13 @@ esp_err_t device_stream_gateway_start(void)
         return ESP_ERR_INVALID_STATE;
     }
     if (s_udp_task == NULL) {
-        BaseType_t created = xTaskCreate(udp_task,
-                                         "device_stream_udp",
-                                         DEVICE_STREAM_UDP_TASK_STACK,
-                                         NULL,
-                                         DEVICE_STREAM_UDP_TASK_PRIORITY,
-                                         &s_udp_task);
+        BaseType_t created = xTaskCreateWithCaps(udp_task,
+                                                 "device_stream_udp",
+                                                 DEVICE_STREAM_UDP_TASK_STACK,
+                                                 NULL,
+                                                 DEVICE_STREAM_UDP_TASK_PRIORITY,
+                                                 &s_udp_task,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (created != pdPASS) {
             s_udp_task = NULL;
             return ESP_ERR_NO_MEM;
@@ -724,9 +894,35 @@ esp_err_t device_stream_gateway_start(void)
 void device_stream_gateway_stop(void)
 {
     s_stream_running = false;
+    reset_stream_runtime("stream_gateway_stop");
 }
 
 bool device_stream_gateway_is_running(void)
 {
     return s_stream_running;
+}
+
+void device_stream_gateway_reset_timestamp_baseline(const char *device_id,
+                                                    const char *reason)
+{
+    const bool reset_all = device_id == NULL || device_id[0] == '\0';
+    if (s_clock_lock != NULL) {
+        xSemaphoreTake(s_clock_lock, portMAX_DELAY);
+    }
+    if (reset_all) {
+        memset(s_clocks, 0, sizeof(s_clocks));
+    } else {
+        for (size_t i = 0; i < DEVICE_STREAM_CLOCK_COUNT; ++i) {
+            if (strcmp(s_clocks[i].device_id, device_id) == 0) {
+                memset(&s_clocks[i], 0, sizeof(s_clocks[i]));
+            }
+        }
+    }
+    if (s_clock_lock != NULL) {
+        xSemaphoreGive(s_clock_lock);
+    }
+    ESP_LOGI(TAG,
+             "stream timestamp baseline reset reason=%s device_id=%s",
+             reason != NULL ? reason : "unknown",
+             reset_all ? "all" : device_id);
 }

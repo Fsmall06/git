@@ -29,6 +29,7 @@ typedef struct {
     size_t body_len;
     bool body_overflow;
     char content_type[SERVER_COMM_CONTENT_TYPE_BUFFER_SIZE];
+    char transfer_encoding[SERVER_COMM_CONTENT_TYPE_BUFFER_SIZE];
     char audio_format[SERVER_COMM_CONTENT_TYPE_BUFFER_SIZE];
     char audio_sample_rate[16];
     char audio_channels[16];

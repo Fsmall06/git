@@ -10,6 +10,7 @@
  * smart-home、/api/voice/turn。本层只做 HTTP transport，不推断或改写 schema。
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -23,22 +24,56 @@ extern "C" {
 
 typedef esp_err_t (*server_client_data_cb_t)(const uint8_t *data, size_t len, void *user_ctx);
 typedef void (*server_client_voice_meta_cb_t)(int64_t content_length, void *user_ctx);
+typedef bool (*server_client_cancel_cb_t)(void *user_ctx);
 
 /** @brief POST 完整 ingest JSON 到 Server；sensor_aggregator 调用，失败由 offline_policy 记录。 */
 esp_err_t server_client_post_ingest_json(const char *json_body,
                                          char *response_body,
                                          size_t response_body_size,
                                          int *http_status);
+/** @brief 可取消 ingest；callback 返回 true 时停止后续 retry。 */
+esp_err_t server_client_post_ingest_json_cancellable(const char *json_body,
+                                                     char *response_body,
+                                                     size_t response_body_size,
+                                                     int *http_status,
+                                                     server_client_cancel_cb_t cancel_cb,
+                                                     void *cancel_ctx);
+/**
+ * @brief Device-scoped cancellable ingest used by C5 sensor upload/replay.
+ *
+ * The existing cancellable API remains unscoped for compatibility. Requests made through this
+ * variant can also be interrupted by server_client_cancel_peer_requests().
+ */
+esp_err_t server_client_post_ingest_json_cancellable_for_device(
+    const char *device_id,
+    const char *json_body,
+    char *response_body,
+    size_t response_body_size,
+    int *http_status,
+    server_client_cancel_cb_t cancel_cb,
+    void *cancel_ctx);
 /** @brief POST S3 canonical CSI event v2 到 Server；payload 已由 protocol_adapter 严格校验。 */
 esp_err_t server_client_post_csi_event_json(const char *json_body,
                                             char *response_body,
                                             size_t response_body_size,
                                             int *http_status);
-/** @brief POST S3 dashboard snapshot 到 Server；sensor_aggregator 调用，失败由 offline_policy 记录。 */
+/** @brief POST S3 gateway-state telemetry 到 Server。 */
 esp_err_t server_client_post_gateway_state_json(const char *json_body,
                                                 char *response_body,
                                                 size_t response_body_size,
                                                 int *http_status);
+/**
+ * @brief POST dashboard snapshot as best-effort traffic.
+ *
+ * Snapshot never occupies the core HTTP slot and returns ESP_ERR_NOT_FINISHED when higher
+ * priority core or telemetry traffic is active. It performs one attempt only.
+ */
+esp_err_t server_client_post_gateway_snapshot_json(const char *json_body,
+                                                   char *response_body,
+                                                   size_t response_body_size,
+                                                   int *http_status);
+/** @brief True when core or telemetry work must run before a best-effort snapshot. */
+bool server_client_snapshot_upload_should_skip(void);
 /** @brief POST system log 到 Server。 */
 esp_err_t server_client_post_system_log_json(const char *json_body,
                                              char *response_body,
@@ -49,6 +84,15 @@ esp_err_t server_client_post_alarm_json(const char *json_body,
                                         char *response_body,
                                         size_t response_body_size,
                                         int *http_status);
+/** @brief 轻量探测 ESP-server 是否可达；network_worker 在打开 LINK_STABLE 前调用。 */
+esp_err_t server_client_probe_available(int *http_status);
+/**
+ * @brief STA epoch 失效或切换时取消旧 epoch 的活跃 HTTP 请求。
+ *
+ * current_epoch 为 0 表示当前无有效 STA IPv4；函数由 network_worker 调用，不在 WiFi callback
+ * 中执行阻塞操作。
+ */
+void server_client_on_network_epoch_changed(uint32_t current_epoch, const char *reason);
 /** @brief 从 smart-home 队列领取待执行命令；smart_home_gateway 调用。 */
 esp_err_t server_client_get_smart_home_pending(char *response_body,
                                                size_t response_body_size,
@@ -64,6 +108,20 @@ esp_err_t server_client_get_pending_commands(const char *device_id,
                                              char *response_body,
                                              size_t response_body_size,
                                              int *http_status);
+/** @brief 可取消 pending 拉取；callback 返回 true 时停止后续 retry。 */
+esp_err_t server_client_get_pending_commands_cancellable(const char *device_id,
+                                                         char *response_body,
+                                                         size_t response_body_size,
+                                                         int *http_status,
+                                                         server_client_cancel_cb_t cancel_cb,
+                                                         void *cancel_ctx);
+/**
+ * @brief Interrupt active command-poll and sensor-ingest HTTP requests for one C5.
+ *
+ * Idempotent when no scoped request is active. Unrelated gateway, voice, CSI and ACK requests are
+ * never registered and are therefore unaffected.
+ */
+esp_err_t server_client_cancel_peer_requests(const char *device_id);
 /** @brief 将 C5 命令 ack 映射后的完整 JSON 回传给 Server；command_router 调用。 */
 esp_err_t server_client_ack_command(const char *command_id,
                                     const char *ack_json,

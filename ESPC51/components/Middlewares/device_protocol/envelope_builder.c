@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app_main_config.h"
+
 static uint32_t s_trace_seq;
 
 static bool envelope_text_is_safe(const char *value)
@@ -20,6 +22,22 @@ static bool envelope_text_is_safe(const char *value)
     return value != NULL && value[0] != '\0' &&
            strchr(value, '"') == NULL &&
            strchr(value, '\\') == NULL;
+}
+
+static bool envelope_local_id_is_valid(const char *value, unsigned int *out)
+{
+    if (value == NULL || out == NULL) {
+        return false;
+    }
+    if (strcmp(value, "1") == 0) {
+        *out = 1U;
+        return true;
+    }
+    if (strcmp(value, "2") == 0) {
+        *out = 2U;
+        return true;
+    }
+    return false;
 }
 
 static uint32_t hash_bytes(uint32_t hash, const void *data, size_t len)
@@ -151,27 +169,66 @@ esp_err_t envelope_builder_format_local_csi_report(const envelope_builder_input_
                                                    char *out,
                                                    size_t out_size)
 {
+    unsigned int local_id = 0U;
     if (input == NULL || out == NULL || out_size == 0U ||
+        !envelope_local_id_is_valid(input->local_id, &local_id) ||
         !envelope_text_is_safe(input->device_id) ||
         !envelope_text_is_safe(input->link_id) ||
         !isfinite(input->metrics.frame_energy) ||
         !isfinite(input->metrics.variance) ||
         !isfinite(input->metrics.cv) ||
-        !isfinite(input->metrics.quality)) {
+        !isfinite(input->metrics.quality) ||
+        !isfinite(input->motion_score) ||
+        !isfinite(input->confidence) ||
+        input->motion_score < 0.0f || input->motion_score > 1.0f ||
+        input->confidence < 0.0f || input->confidence > 1.0f) {
         return ESP_ERR_INVALID_ARG;
     }
 
+#if CSI_OUTPUT_ENABLE_DEBUG_METRICS
     int written = snprintf(out,
                            out_size,
-                           "{\"id\":\"%s\",\"t\":%lld,\"lid\":\"%s\","
+                           "{\"id\":%u,\"device_id\":\"%s\",\"lid\":\"%s\",\"t\":%lld,"
+                           "\"state\":\"%s\",\"motion_score\":%.6g,\"confidence\":%.6g,"
+                           "\"quality\":%.6g,\"rssi\":%d,"
+                           "\"energy\":%.6g,\"variance\":%.6g,\"cv\":%.6g,"
                            "\"v\":[%.6g,%.6g,%.6g,%d,%.6g]}",
+                           local_id,
                            input->device_id,
-                           (long long)input->timestamp_ms,
                            input->link_id,
+                           (long long)input->timestamp_ms,
+                           envelope_builder_state_hint_to_string(input->state_hint),
+                           (double)input->motion_score,
+                           (double)input->confidence,
+                           (double)input->metrics.quality,
+                           input->metrics.rssi,
+                           (double)input->metrics.frame_energy,
+                           (double)input->metrics.variance,
+                           (double)input->metrics.cv,
                            (double)input->metrics.frame_energy,
                            (double)input->metrics.variance,
                            (double)input->metrics.cv,
                            input->metrics.rssi,
                            (double)input->metrics.quality);
+#else
+    int written = snprintf(out,
+                           out_size,
+                           "{\"id\":%u,\"device_id\":\"%s\",\"lid\":\"%s\",\"t\":%lld,"
+                           "\"state\":\"%s\",\"motion_score\":%.6g,\"confidence\":%.6g,"
+                           "\"quality\":%.6g,\"rssi\":%d,"
+                           "\"energy\":%.6g,\"variance\":%.6g,\"cv\":%.6g}",
+                           local_id,
+                           input->device_id,
+                           input->link_id,
+                           (long long)input->timestamp_ms,
+                           envelope_builder_state_hint_to_string(input->state_hint),
+                           (double)input->motion_score,
+                           (double)input->confidence,
+                           (double)input->metrics.quality,
+                           input->metrics.rssi,
+                           (double)input->metrics.frame_energy,
+                           (double)input->metrics.variance,
+                           (double)input->metrics.cv);
+#endif
     return written > 0 && written < (int)out_size ? ESP_OK : ESP_ERR_INVALID_SIZE;
 }

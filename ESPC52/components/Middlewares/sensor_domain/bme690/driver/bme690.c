@@ -1082,7 +1082,10 @@ esp_err_t bme690_read(bme690_data_t *data)
     data->new_data = raw.new_data;
     data->gas_valid = raw.gas_valid;
     data->heat_stable = raw.heat_stable;
+    data->gas_adc = raw.adc_gas_resistance;
     data->gas_range = raw.gas_range;
+    data->heater_temp = BME690_GAS_HEATER_TEMP_C;
+    data->heater_time_ms = BME690_GAS_HEATER_DURATION_MS;
     data->gas_index = raw.gas_index;
     data->measurement_index = raw.measurement_index;
 

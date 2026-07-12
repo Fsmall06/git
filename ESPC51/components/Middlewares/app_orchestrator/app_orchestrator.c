@@ -143,7 +143,7 @@ void app_orchestrator_start(void)
 
     esp_err_t scheduler_ret = c5_scheduler_start();
     if (scheduler_ret != ESP_OK) {
-        ESP_LOGE(TAG, "C5 scheduler start failed: %s", esp_err_to_name(scheduler_ret));
+        ESP_LOGE(TAG, "C5 runtime dispatcher start failed: %s", esp_err_to_name(scheduler_ret));
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_c5_scheduler_start");
 
@@ -161,7 +161,7 @@ void app_orchestrator_start(void)
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_voice_chain_start");
 
-    // WiFi 重连、Mic ADC/VAD、本地 voice turn、speaker PCM 播放和 C5 scheduler 都在后台任务中运行。
+    // WiFi 重连、Mic ADC/VAD、本地 voice turn、speaker PCM 播放和 C5 runtime 都在后台任务中运行。
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(MAIN_IDLE_DELAY_MS));
     }

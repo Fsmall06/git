@@ -29,7 +29,10 @@ set(voice_srcs
             voice_domain/voice_chain.c)
 
 set(runtime_srcs
-            runtime/app_runtime.c)
+            runtime/app_runtime.c
+            runtime/c5_backpressure_controller.c
+            runtime/c5_event_bus.c
+            runtime/c5_runtime_workers.c)
 
 set(device_protocol_srcs
             device_protocol/envelope_builder.c
@@ -43,6 +46,7 @@ set(sensor_srcs
             sensor_domain/bme690/server_client/bme_server_client.c
             sensor_domain/csi_placeholder/csi_service.c
             sensor_domain/csi_placeholder/csi_server_client.c
+            sensor_domain/csi_edge_detector/csi_edge_detector.c
             sensor_domain/csi_phase_a/csi_capture.c
             sensor_domain/csi_phase_a/csi_feature.c
             sensor_domain/csi_phase_a/csi_phase_a_tests.c)
@@ -82,6 +86,7 @@ set(priv_include_dirs
             sensor_domain/bme690/service
             sensor_domain/bme690/server_client
             sensor_domain/csi_placeholder
+            sensor_domain/csi_edge_detector
             sensor_domain/csi_phase_a
             command_domain/system_command)
 
@@ -90,6 +95,7 @@ set(requires
             esp_event
             esp_netif
             nvs_flash
+            spiffs
             esp_adc
             app_config
             esp_rom

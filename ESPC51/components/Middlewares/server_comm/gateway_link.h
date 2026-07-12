@@ -70,6 +70,9 @@ bool gateway_link_is_ready(void);
 /** @brief 状态非 READY 时即为 reconnect mode。 */
 bool gateway_link_in_reconnect_mode(void);
 
+/** @brief 普通任务门控：READY 才返回 true；否则限频打印 reconnect skip 日志。 */
+bool gateway_link_can_run_non_voice_task(const char *task_name);
+
 /** @brief 语音启动门控：READY 才返回 true；否则限频提示 gateway offline。 */
 bool gateway_link_can_start_voice_turn(void);
 

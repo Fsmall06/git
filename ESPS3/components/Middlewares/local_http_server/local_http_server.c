@@ -24,10 +24,13 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "gateway_config.h"
 #include "gateway_wifi.h"
 #include "offline_policy.h"
 #include "protocol_adapter.h"
+#include "resource_manager.h"
 #include "s3_scheduler.h"
 #include "voice_proxy.h"
 #include "wake_prompt_cache_gateway.h"
@@ -37,10 +40,121 @@
 static const char *TAG = "local_http";
 
 static httpd_handle_t s_server;
-static int64_t s_last_csi_rx_log_ms;
+static bool s_server_routes_registered;
+static local_http_server_state_t s_server_state = LOCAL_HTTP_SERVER_STATE_STOPPED;
+static StaticSemaphore_t s_server_lock_storage;
+static SemaphoreHandle_t s_server_lock;
+static portMUX_TYPE s_server_lock_mux = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_last_csi_rx_reject_log_ms;
 
 #define CSI_RX_LOG_INTERVAL_MS 1000LL
+#define ESP111_PROTOCOL_LOCAL_JSON_LOCAL_ID "local_id"
+
+typedef struct {
+    char device_id[PROTOCOL_ADAPTER_TEXT_LEN];
+    char link_id[PROTOCOL_ADAPTER_TEXT_LEN];
+    int64_t last_log_ms;
+} csi_rx_log_slot_t;
+
+static csi_rx_log_slot_t s_csi_rx_log_slots[GATEWAY_CONFIG_MAX_CHILDREN];
+
+static void snapshot_resource_session(const char *device_id,
+                                      s3_runtime_ingress_t *ingress)
+{
+    if (device_id == NULL || device_id[0] == '\0' || ingress == NULL) {
+        return;
+    }
+
+    resource_manager_session_view_t view = {0};
+    if (resource_manager_get_session(device_id, &view)) {
+        ingress->resource_generation = view.generation;
+        ingress->resource_state_at_rx = view.state;
+        ingress->resource_state_since_ms_at_rx = view.state_since_ms;
+    }
+}
+
+static SemaphoreHandle_t server_lock_handle(void)
+{
+    if (s_server_lock == NULL) {
+        portENTER_CRITICAL(&s_server_lock_mux);
+        if (s_server_lock == NULL) {
+            s_server_lock = xSemaphoreCreateMutexStatic(&s_server_lock_storage);
+        }
+        portEXIT_CRITICAL(&s_server_lock_mux);
+    }
+    return s_server_lock;
+}
+
+const char *local_http_server_state_name(local_http_server_state_t state)
+{
+    switch (state) {
+    case LOCAL_HTTP_SERVER_STATE_STARTING:
+        return "STARTING";
+    case LOCAL_HTTP_SERVER_STATE_RUNNING:
+        return "RUNNING";
+    case LOCAL_HTTP_SERVER_STATE_STOPPING:
+        return "STOPPING";
+    case LOCAL_HTTP_SERVER_STATE_FAILED:
+        return "FAILED";
+    case LOCAL_HTTP_SERVER_STATE_STOPPED:
+    default:
+        return "STOPPED";
+    }
+}
+
+static void log_server_state_locked(local_http_server_state_t state,
+                                    const char *reason,
+                                    esp_err_t ret)
+{
+    s_server_state = state;
+    const char *state_name = local_http_server_state_name(state);
+    const char *safe_reason = reason != NULL && reason[0] != '\0' ? reason : "unspecified";
+    const char *ret_name = esp_err_to_name(ret);
+    if (state == LOCAL_HTTP_SERVER_STATE_FAILED) {
+        ESP_LOGE(TAG,
+                 "local_http state: %s reason=%s handle=%p routes=%d ret=%s",
+                 state_name,
+                 safe_reason,
+                 (void *)s_server,
+                 s_server_routes_registered ? 1 : 0,
+                 ret_name);
+        return;
+    }
+    ESP_LOGI(TAG,
+             "local_http state: %s reason=%s handle=%p routes=%d ret=%s",
+             state_name,
+             safe_reason,
+             (void *)s_server,
+             s_server_routes_registered ? 1 : 0,
+             ret_name);
+}
+
+static void clear_server_state_locked(void)
+{
+    s_server = NULL;
+    s_server_routes_registered = false;
+}
+
+/* The caller owns s_server_lock. A failed stop retains the handle for the next cleanup attempt. */
+static esp_err_t stop_server_locked(const char *reason)
+{
+    log_server_state_locked(LOCAL_HTTP_SERVER_STATE_STOPPING, reason, ESP_OK);
+    if (s_server == NULL) {
+        clear_server_state_locked();
+        log_server_state_locked(LOCAL_HTTP_SERVER_STATE_STOPPED, reason, ESP_OK);
+        return ESP_OK;
+    }
+
+    const esp_err_t ret = httpd_stop(s_server);
+    if (ret == ESP_OK) {
+        clear_server_state_locked();
+        log_server_state_locked(LOCAL_HTTP_SERVER_STATE_STOPPED, reason, ret);
+        return ESP_OK;
+    }
+
+    log_server_state_locked(LOCAL_HTTP_SERVER_STATE_FAILED, reason, ret);
+    return ret;
+}
 
 static bool should_log_csi_rx(int64_t *last_log_ms)
 {
@@ -56,9 +170,83 @@ static bool should_log_csi_rx(int64_t *last_log_ms)
     return true;
 }
 
+static bool should_log_csi_rx_for_link(const char *device_id, const char *link_id)
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    const char *device_key = device_id != NULL && device_id[0] != '\0' ? device_id : "-";
+    const char *link_key = link_id != NULL && link_id[0] != '\0' ? link_id : "-";
+    csi_rx_log_slot_t *candidate = NULL;
+
+    for (size_t i = 0; i < GATEWAY_CONFIG_MAX_CHILDREN; ++i) {
+        if (s_csi_rx_log_slots[i].device_id[0] == '\0' && candidate == NULL) {
+            candidate = &s_csi_rx_log_slots[i];
+            continue;
+        }
+        if (strcmp(s_csi_rx_log_slots[i].device_id, device_key) == 0 &&
+            strcmp(s_csi_rx_log_slots[i].link_id, link_key) == 0) {
+            candidate = &s_csi_rx_log_slots[i];
+            break;
+        }
+    }
+    if (candidate == NULL) {
+        candidate = &s_csi_rx_log_slots[0];
+    }
+    if (candidate->device_id[0] == '\0' ||
+        strcmp(candidate->device_id, device_key) != 0 ||
+        strcmp(candidate->link_id, link_key) != 0) {
+        strlcpy(candidate->device_id, device_key, sizeof(candidate->device_id));
+        strlcpy(candidate->link_id, link_key, sizeof(candidate->link_id));
+        candidate->last_log_ms = 0;
+    }
+    if (candidate->last_log_ms != 0 &&
+        now_ms - candidate->last_log_ms < CSI_RX_LOG_INTERVAL_MS) {
+        return false;
+    }
+    candidate->last_log_ms = now_ms;
+    return true;
+}
+
 static cJSON *json_item(cJSON *root, const char *key)
 {
     return root != NULL ? cJSON_GetObjectItemCaseSensitive(root, key) : NULL;
+}
+
+static const char *short_device_id_for_local_id(uint8_t local_id)
+{
+    switch (local_id) {
+    case ESP111_PROTOCOL_LOCAL_DEVICE_ID_C51:
+        return "C51";
+    case ESP111_PROTOCOL_LOCAL_DEVICE_ID_C52:
+        return "C52";
+    default:
+        return NULL;
+    }
+}
+
+static bool local_id_number_is_allowed(const cJSON *item, uint8_t *out_local_id)
+{
+    if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble)) {
+        return false;
+    }
+    if (item->valuedouble != (double)item->valueint) {
+        return false;
+    }
+    if (item->valueint != (int)ESP111_PROTOCOL_LOCAL_DEVICE_ID_C51 &&
+        item->valueint != (int)ESP111_PROTOCOL_LOCAL_DEVICE_ID_C52) {
+        return false;
+    }
+    if (out_local_id != NULL) {
+        *out_local_id = (uint8_t)item->valueint;
+    }
+    return true;
+}
+
+static cJSON *local_id_item_from_json(cJSON *root)
+{
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(root, ESP111_PROTOCOL_LOCAL_JSON_ID);
+    return id != NULL ? id :
+                        cJSON_GetObjectItemCaseSensitive(root,
+                                                         ESP111_PROTOCOL_LOCAL_JSON_LOCAL_ID);
 }
 
 static const char *json_diag_string(cJSON *root, const char *key)
@@ -205,6 +393,18 @@ static bool csi_diag_array_has_invalid_number(cJSON *array)
     return false;
 }
 
+static bool csi_diag_has_edge_fields(cJSON *root)
+{
+    cJSON *state = csi_diag_item(root, "state", "state_hint");
+    cJSON *motion_score = json_item(root, "motion_score");
+    cJSON *confidence = json_item(root, "confidence");
+    return cJSON_IsString(state) && state->valuestring != NULL && state->valuestring[0] != '\0' &&
+           cJSON_IsNumber(motion_score) && isfinite(motion_score->valuedouble) &&
+           cJSON_IsNumber(confidence) && isfinite(confidence->valuedouble) &&
+           motion_score->valuedouble >= 0.0 && motion_score->valuedouble <= 1.0 &&
+           confidence->valuedouble >= 0.0 && confidence->valuedouble <= 1.0;
+}
+
 static void csi_diag_reject_reason(cJSON *root, char *out, size_t out_size)
 {
     if (out == NULL || out_size == 0U) {
@@ -223,6 +423,7 @@ static void csi_diag_reject_reason(cJSON *root, char *out, size_t out_size)
                                      ESP111_PROTOCOL_JSON_TIMESTAMP_MS);
     cJSON *values = json_item(root, ESP111_PROTOCOL_LOCAL_JSON_VALUES);
     cJSON *metrics = json_item(root, "metrics");
+    bool has_edge_fields = csi_diag_has_edge_fields(root);
 
     if (!csi_diag_has_text_or_number(id)) {
         strlcpy(out, "missing id", out_size);
@@ -232,7 +433,9 @@ static void csi_diag_reject_reason(cJSON *root, char *out, size_t out_size)
         strlcpy(out, "missing lid", out_size);
         return;
     }
-    if (!cJSON_IsObject(metrics) && (!cJSON_IsArray(values) || cJSON_GetArraySize(values) != 5)) {
+    if (!has_edge_fields &&
+        !cJSON_IsObject(metrics) &&
+        (!cJSON_IsArray(values) || cJSON_GetArraySize(values) != 5)) {
         strlcpy(out, "invalid v length", out_size);
         return;
     }
@@ -245,7 +448,10 @@ static void csi_diag_reject_reason(cJSON *root, char *out, size_t out_size)
 
 static void log_csi_rx(const protocol_adapter_envelope_t *envelope, size_t bytes)
 {
-    if (!should_log_csi_rx(&s_last_csi_rx_log_ms)) {
+    const char *device_id =
+        envelope != NULL && envelope->device_id[0] != '\0' ? envelope->device_id : "-";
+    const char *link_id = csi_diag_string(envelope, "link_id");
+    if (!should_log_csi_rx_for_link(device_id, link_id)) {
         return;
     }
 
@@ -253,11 +459,15 @@ static void log_csi_rx(const protocol_adapter_envelope_t *envelope, size_t bytes
     csi_diag_motion_score(envelope, motion_score, sizeof(motion_score));
     ESP_LOGI(TAG,
              "CSI_RX device_id=%s link_id=%s bytes=%u state=%s motion_score=%s",
-             envelope != NULL && envelope->device_id[0] != '\0' ? envelope->device_id : "-",
-             csi_diag_string(envelope, "link_id"),
+             device_id,
+             link_id,
              (unsigned int)bytes,
              csi_diag_state(envelope),
              motion_score);
+    resource_manager_log_session_diagnostic(device_id,
+                                            link_id,
+                                            "csi_rx",
+                                            "accepted");
 }
 
 static void log_csi_rx_reject(esp_err_t ret, const char *body, size_t body_len, const char *json_error)
@@ -420,12 +630,15 @@ static void read_peer_ip(httpd_req_t *req, char *out, size_t out_size)
     }
 }
 
-static esp_err_t enqueue_body_buffer(httpd_req_t *req,
-                                     const char *body,
+static uint8_t local_id_from_json_body(const char *body, size_t body_len);
+
+static esp_err_t enqueue_body_buffer(const char *body,
                                      size_t body_len,
                                      s3_runtime_msg_kind_t kind,
                                      const char *command_id,
-                                     s3_scheduler_priority_t priority)
+                                     s3_scheduler_priority_t priority,
+                                     int64_t received_at_us,
+                                     const char *peer_ip)
 {
     if (body == NULL || body_len == 0U || body_len > S3_RUNTIME_BUS_BODY_MAX) {
         return ESP_ERR_INVALID_SIZE;
@@ -437,15 +650,33 @@ static esp_err_t enqueue_body_buffer(httpd_req_t *req,
         return ESP_ERR_NO_MEM;
     }
 
+    int64_t rx_time_us = received_at_us > 0 ? received_at_us : esp_timer_get_time();
+    int64_t rx_time_ms = rx_time_us / 1000;
     ingress->kind = kind;
+    ingress->rx_time_us = rx_time_us;
+    ingress->rx_time_ms = rx_time_ms;
     ingress->body_len = body_len;
     memcpy(ingress->body, body, body_len);
     ingress->body[body_len] = '\0';
-    ingress->unified.t = esp_timer_get_time() / 1000;
+    ingress->unified.t = rx_time_ms;
     if (command_id != NULL) {
         strlcpy(ingress->command_id, command_id, sizeof(ingress->command_id));
     }
-    read_peer_ip(req, ingress->peer_ip, sizeof(ingress->peer_ip));
+    uint8_t local_id = local_id_from_json_body(body, body_len);
+    if (local_id != 0U) {
+        const char *short_id = short_device_id_for_local_id(local_id);
+        if (short_id != NULL) {
+            strlcpy(ingress->unified.did, short_id, sizeof(ingress->unified.did));
+        }
+        const char *device_id = protocol_adapter_local_device_id_to_device_id(local_id);
+        if (device_id != NULL) {
+            strlcpy(ingress->device_id, device_id, sizeof(ingress->device_id));
+            snapshot_resource_session(device_id, ingress);
+        }
+    }
+    if (peer_ip != NULL && peer_ip[0] != '\0') {
+        strlcpy(ingress->peer_ip, peer_ip, sizeof(ingress->peer_ip));
+    }
 
     return s3_scheduler_enqueue_ingress_owned(ingress, priority);
 }
@@ -477,6 +708,9 @@ static esp_err_t enqueue_local_or_error(httpd_req_t *req,
                                         const char *status,
                                         const char *error_code)
 {
+    const int64_t received_at_us = esp_timer_get_time();
+    char peer_ip[16] = {0};
+    read_peer_ip(req, peer_ip, sizeof(peer_ip));
     char *body = NULL;
     size_t body_len = 0;
     esp_err_t ret = read_json_body(req, &body, &body_len);
@@ -488,7 +722,13 @@ static esp_err_t enqueue_local_or_error(httpd_req_t *req,
     uint8_t local_id = 0;
     ret = validate_local_body(body, body_len, &local_id);
     if (ret == ESP_OK) {
-        ret = enqueue_body_buffer(req, body, body_len, kind, NULL, priority);
+        ret = enqueue_body_buffer(body,
+                                  body_len,
+                                  kind,
+                                  NULL,
+                                  priority,
+                                  received_at_us,
+                                  peer_ip);
     }
     heap_caps_free(body);
 
@@ -508,13 +748,68 @@ static uint8_t local_id_from_json_body(const char *body, size_t body_len)
     uint8_t local_id = 0;
     cJSON *root = body != NULL ? cJSON_ParseWithLength(body, body_len) : NULL;
     if (root != NULL) {
-        cJSON *id = cJSON_GetObjectItemCaseSensitive(root, ESP111_PROTOCOL_LOCAL_JSON_ID);
-        if (cJSON_IsNumber(id)) {
-            local_id = (uint8_t)id->valueint;
+        cJSON *id = local_id_item_from_json(root);
+        if (local_id_number_is_allowed(id, &local_id)) {
+            /* accepted */
+        } else if (cJSON_IsString(id) && id->valuestring != NULL) {
+            local_id = protocol_adapter_device_id_to_local_id(id->valuestring);
         }
         cJSON_Delete(root);
     }
     return local_id;
+}
+
+static esp_err_t validate_command_ack_local_id(const char *body,
+                                               size_t body_len,
+                                               const char *command_id,
+                                               uint8_t *out_local_id)
+{
+    if (body == NULL || body_len == 0U || out_local_id == NULL) {
+        ESP_LOGW(TAG, "command ACK rejected command_id=%s reason=empty_body",
+                 command_id != NULL ? command_id : "-");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_local_id = 0U;
+    cJSON *root = cJSON_ParseWithLength(body, body_len);
+    if (root == NULL) {
+        ESP_LOGW(TAG, "command ACK rejected command_id=%s reason=invalid_json",
+                 command_id != NULL ? command_id : "-");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(root, ESP111_PROTOCOL_LOCAL_JSON_ID);
+    cJSON *local_id =
+        cJSON_GetObjectItemCaseSensitive(root, ESP111_PROTOCOL_LOCAL_JSON_LOCAL_ID);
+    cJSON *identity = id != NULL ? id : local_id;
+    uint8_t parsed = 0U;
+    esp_err_t ret = ESP_OK;
+    if (identity == NULL) {
+        ESP_LOGW(TAG, "command ACK rejected command_id=%s reason=missing_id",
+                 command_id != NULL ? command_id : "-");
+        ret = ESP_ERR_INVALID_ARG;
+    } else if (!local_id_number_is_allowed(identity, &parsed)) {
+        ESP_LOGW(TAG,
+                 "command ACK rejected command_id=%s reason=invalid_id value=%d",
+                 command_id != NULL ? command_id : "-",
+                 cJSON_IsNumber(identity) ? identity->valueint : -1);
+        ret = ESP_ERR_NOT_ALLOWED;
+    } else if (id != NULL && local_id != NULL) {
+        uint8_t local_id_value = 0U;
+        if (!local_id_number_is_allowed(local_id, &local_id_value) ||
+            local_id_value != parsed) {
+            ESP_LOGW(TAG,
+                     "command ACK rejected command_id=%s reason=id_local_id_mismatch",
+                     command_id != NULL ? command_id : "-");
+            ret = ESP_ERR_NOT_ALLOWED;
+        }
+    }
+
+    if (ret == ESP_OK) {
+        *out_local_id = parsed;
+    }
+    cJSON_Delete(root);
+    return ret;
 }
 
 static esp_err_t health_handler(httpd_req_t *req)
@@ -560,7 +855,7 @@ static esp_err_t health_update_handler(httpd_req_t *req)
 {
     return enqueue_local_or_error(req,
                                   S3_RUNTIME_MSG_STATUS,
-                                  S3_SCHEDULER_PRIORITY_HIGH,
+                                  S3_SCHEDULER_PRIORITY_NORMAL,
                                   "202 Accepted",
                                   ESP111_PROTOCOL_ERROR_INVALID_HEARTBEAT);
 }
@@ -572,14 +867,16 @@ static esp_err_t status_or_sensor_handler(httpd_req_t *req)
                                                               S3_RUNTIME_MSG_STATUS;
     return enqueue_local_or_error(req,
                                   kind,
-                                  kind == S3_RUNTIME_MSG_SENSOR ? S3_SCHEDULER_PRIORITY_NORMAL :
-                                                                  S3_SCHEDULER_PRIORITY_HIGH,
+                                  S3_SCHEDULER_PRIORITY_NORMAL,
                                   "202 Accepted",
                                   ESP111_PROTOCOL_ERROR_INVALID_ENVELOPE);
 }
 
 static esp_err_t csi_result_handler(httpd_req_t *req)
 {
+    const int64_t received_at_us = esp_timer_get_time();
+    char peer_ip[16] = {0};
+    read_peer_ip(req, peer_ip, sizeof(peer_ip));
     char *body = NULL;
     size_t body_len = 0;
     esp_err_t ret = read_json_body(req, &body, &body_len);
@@ -610,12 +907,13 @@ static esp_err_t csi_result_handler(httpd_req_t *req)
     ret = protocol_adapter_validate_local_envelope(&envelope);
     uint8_t local_id = protocol_adapter_device_id_to_local_id(envelope.device_id);
     if (ret == ESP_OK) {
-        ret = enqueue_body_buffer(req,
-                                  body,
+        ret = enqueue_body_buffer(body,
                                   body_len,
                                   S3_RUNTIME_MSG_CSI,
                                   NULL,
-                                  S3_SCHEDULER_PRIORITY_NORMAL);
+                                  S3_SCHEDULER_PRIORITY_NORMAL,
+                                  received_at_us,
+                                  peer_ip);
     }
 
     if (ret == ESP_OK) {
@@ -685,6 +983,9 @@ static esp_err_t commands_pending_handler(httpd_req_t *req)
 
 static esp_err_t command_ack_handler(httpd_req_t *req)
 {
+    const int64_t received_at_us = esp_timer_get_time();
+    char peer_ip[16] = {0};
+    read_peer_ip(req, peer_ip, sizeof(peer_ip));
     const char *prefix = ESP111_PROTOCOL_ROUTE_COMMANDS_PREFIX;
     const char *suffix = ESP111_PROTOCOL_ROUTE_COMMAND_ACK_SUFFIX;
     const char *start = req->uri + strlen(prefix);
@@ -717,42 +1018,134 @@ static esp_err_t command_ack_handler(httpd_req_t *req)
                           esp_err_to_name(ret));
     }
 
-    uint8_t local_id = local_id_from_json_body(body, body_len);
-    ret = enqueue_body_buffer(req,
-                              body,
-                              body_len,
-                              S3_RUNTIME_MSG_EVENT,
-                              command_id,
-                              S3_SCHEDULER_PRIORITY_HIGH);
+    uint8_t local_id = 0U;
+    ret = validate_command_ack_local_id(body, body_len, command_id, &local_id);
+    if (ret == ESP_OK) {
+        ret = enqueue_body_buffer(body,
+                                  body_len,
+                                  S3_RUNTIME_MSG_EVENT,
+                                  command_id,
+                                  S3_SCHEDULER_PRIORITY_HIGH,
+                                  received_at_us,
+                                  peer_ip);
+    }
     heap_caps_free(body);
     if (ret != ESP_OK) {
         const char *http_status =
             (ret == ESP_ERR_TIMEOUT || ret == ESP_ERR_NO_MEM ||
              ret == ESP_ERR_INVALID_STATE) ? "503 Service Unavailable" : "400 Bad Request";
+        const bool invalid_ack =
+            ret == ESP_ERR_INVALID_ARG || ret == ESP_ERR_NOT_ALLOWED ||
+            ret == ESP_ERR_INVALID_SIZE;
         return send_error(req,
                           http_status,
                           ret == ESP_ERR_TIMEOUT ? ESP111_PROTOCOL_ERROR_TIMEOUT :
-                                                   ESP111_PROTOCOL_ERROR_ACK_FAILED,
+                          invalid_ack ? ESP111_PROTOCOL_ERROR_INVALID_ACK :
+                                        ESP111_PROTOCOL_ERROR_ACK_FAILED,
                           esp_err_to_name(ret));
     }
 
     return send_local_ok(req, local_id, "200 OK");
 }
 
+local_http_server_state_t local_http_server_get_state(void)
+{
+    SemaphoreHandle_t lock = server_lock_handle();
+    if (lock == NULL) {
+        return LOCAL_HTTP_SERVER_STATE_FAILED;
+    }
+    if (xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        return LOCAL_HTTP_SERVER_STATE_FAILED;
+    }
+
+    const local_http_server_state_t state = s_server_state;
+    xSemaphoreGive(lock);
+    return state;
+}
+
+bool local_http_server_is_running(void)
+{
+    SemaphoreHandle_t lock = server_lock_handle();
+    if (lock == NULL || xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+
+    const bool running = s_server != NULL && s_server_routes_registered &&
+                         s_server_state == LOCAL_HTTP_SERVER_STATE_RUNNING;
+    xSemaphoreGive(lock);
+    return running;
+}
+
+bool local_http_server_has_handle(void)
+{
+    SemaphoreHandle_t lock = server_lock_handle();
+    if (lock == NULL || xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        return true;
+    }
+
+    const bool has_handle = s_server != NULL;
+    xSemaphoreGive(lock);
+    return has_handle;
+}
+
 esp_err_t local_http_server_start(void)
 {
-    if (s_server != NULL) {
+    return local_http_server_start_with_reason("direct_start");
+}
+
+esp_err_t local_http_server_start_with_reason(const char *reason)
+{
+    SemaphoreHandle_t lock = server_lock_handle();
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (s_server != NULL && s_server_routes_registered) {
+        log_server_state_locked(LOCAL_HTTP_SERVER_STATE_RUNNING, reason, ESP_OK);
+        xSemaphoreGive(lock);
         return ESP_OK;
     }
 
+    if (s_server != NULL) {
+        /* Never start another listener while a partial instance still owns port 80. */
+        esp_err_t stop_ret = stop_server_locked("start_preflight_cleanup");
+        if (stop_ret != ESP_OK) {
+            xSemaphoreGive(lock);
+            return stop_ret;
+        }
+    }
+
+    if (!gateway_wifi_is_softap_ready()) {
+        clear_server_state_locked();
+        log_server_state_locked(LOCAL_HTTP_SERVER_STATE_FAILED, "softap_not_ready", ESP_ERR_INVALID_STATE);
+        xSemaphoreGive(lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    log_server_state_locked(LOCAL_HTTP_SERVER_STATE_STARTING, reason, ESP_OK);
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = gateway_config_get()->local_http_port;
+    config.max_open_sockets = 4;
     config.max_uri_handlers = 13;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8192;
 
-    esp_err_t ret = httpd_start(&s_server, &config);
+    httpd_handle_t server = NULL;
+    esp_err_t ret = httpd_start(&server, &config);
     if (ret != ESP_OK) {
+        /* ESP-IDF normally returns NULL on this path; clean defensively if that ever changes. */
+        if (server != NULL) {
+            s_server = server;
+            s_server_routes_registered = false;
+            (void)stop_server_locked("httpd_start_failure_cleanup");
+        } else {
+            clear_server_state_locked();
+        }
+        log_server_state_locked(LOCAL_HTTP_SERVER_STATE_FAILED, reason, ret);
+        xSemaphoreGive(lock);
         return ret;
     }
 
@@ -773,30 +1166,45 @@ esp_err_t local_http_server_start(void)
     };
 
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
-        ret = httpd_register_uri_handler(s_server, &routes[i]);
+        ret = httpd_register_uri_handler(server, &routes[i]);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "register route failed uri=%s ret=%s", routes[i].uri, esp_err_to_name(ret));
+            s_server = server;
+            s_server_routes_registered = false;
+            (void)stop_server_locked("route_register_failure_cleanup");
+            log_server_state_locked(LOCAL_HTTP_SERVER_STATE_FAILED, "route_register_failure", ret);
+            xSemaphoreGive(lock);
             return ret;
         }
     }
 
-    ESP_LOGI(TAG, "local HTTP server started port=%u base=%s",
+    s_server = server;
+    s_server_routes_registered = true;
+    log_server_state_locked(LOCAL_HTTP_SERVER_STATE_RUNNING, reason, ESP_OK);
+    ESP_LOGI(TAG, "local HTTP server started port=%u base=%s handle=%p",
              (unsigned int)gateway_config_get()->local_http_port,
-             ESP111_PROTOCOL_LOCAL_BASE);
+             ESP111_PROTOCOL_LOCAL_BASE,
+             (void *)s_server);
+    xSemaphoreGive(lock);
     return ESP_OK;
 }
 
 esp_err_t local_http_server_stop(void)
 {
-    if (s_server == NULL) {
-        return ESP_OK;
+    return local_http_server_stop_with_reason("direct_stop");
+}
+
+esp_err_t local_http_server_stop_with_reason(const char *reason)
+{
+    SemaphoreHandle_t lock = server_lock_handle();
+    if (lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
 
-    httpd_handle_t server = s_server;
-    s_server = NULL;
-    esp_err_t ret = httpd_stop(server);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "local HTTP server stopped");
-    }
+    const esp_err_t ret = stop_server_locked(reason);
+    xSemaphoreGive(lock);
     return ret;
 }

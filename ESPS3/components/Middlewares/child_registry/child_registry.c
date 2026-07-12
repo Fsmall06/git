@@ -23,6 +23,58 @@ static child_registry_entry_t s_entries[GATEWAY_CONFIG_MAX_CHILDREN];
 static SemaphoreHandle_t s_lock;
 static bool s_initialized;
 
+static child_registry_status_t refresh_status_locked(child_registry_entry_t *entry,
+                                                     int64_t timestamp_ms);
+
+static bool peer_mac_is_valid(const uint8_t peer_mac[CHILD_REGISTRY_PEER_MAC_LEN])
+{
+    if (peer_mac == NULL || (peer_mac[0] & 0x01U) != 0U) {
+        return false;
+    }
+
+    bool any_nonzero = false;
+    for (size_t i = 0; i < CHILD_REGISTRY_PEER_MAC_LEN; ++i) {
+        any_nonzero = any_nonzero || peer_mac[i] != 0U;
+    }
+    return any_nonzero;
+}
+
+static bool status_is_onlineish(child_registry_status_t status)
+{
+    return status == CHILD_REGISTRY_STATUS_ONLINE ||
+           status == CHILD_REGISTRY_STATUS_VOICE_BUSY ||
+           status == CHILD_REGISTRY_STATUS_LINK_LOST;
+}
+
+static const char *offline_reason_locked(const child_registry_entry_t *entry,
+                                         child_registry_status_t status)
+{
+    if (entry == NULL || !entry->registered) {
+        return "never_seen";
+    }
+    if (status != CHILD_REGISTRY_STATUS_OFFLINE) {
+        return NULL;
+    }
+    return entry->link_lost_since_ms > 0 ? "link_lost_grace_expired" : "heartbeat_timeout";
+}
+
+static void set_default_status_view(child_registry_status_view_t *view)
+{
+    if (view == NULL) {
+        return;
+    }
+
+    *view = (child_registry_status_view_t){
+        .registered = false,
+        .online = false,
+        .status = CHILD_REGISTRY_STATUS_OFFLINE,
+        .last_seen_ms = 0,
+        .link_lost = false,
+        .voice_busy = false,
+        .offline_reason = "never_seen",
+    };
+}
+
 const char *child_registry_status_name(child_registry_status_t status)
 {
     switch (status) {
@@ -185,10 +237,64 @@ esp_err_t child_registry_touch(const char *device_id, uint32_t seq)
     entry->last_seq = seq;
     entry->last_seen_ms = now_ms();
     entry->link_lost_since_ms = 0;
+    /* A validated heartbeat/sensor/CSI identity is sufficient to own a session. */
+    entry->registered = true;
     if (entry->status != CHILD_REGISTRY_STATUS_VOICE_BUSY) {
         entry->status = CHILD_REGISTRY_STATUS_ONLINE;
     }
     entry->online = true;
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
+}
+
+esp_err_t child_registry_confirm_identity(const char *device_id)
+{
+    if (!child_registry_is_allowed(device_id)) {
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    child_registry_entry_t *entry = find_or_allocate_locked(device_id);
+    if (entry == NULL) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    entry->last_seen_ms = now_ms();
+    entry->link_lost_since_ms = 0;
+    entry->registered = true;
+    if (entry->status != CHILD_REGISTRY_STATUS_VOICE_BUSY) {
+        entry->status = CHILD_REGISTRY_STATUS_ONLINE;
+    }
+    entry->online = true;
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
+}
+
+esp_err_t child_registry_note_activity(const char *device_id, uint32_t seq)
+{
+    if (!child_registry_is_allowed(device_id)) {
+        ESP_LOGW(TAG,
+                 "child activity rejected device_id=%s reason=not_allowed",
+                 device_id != NULL ? device_id : "<null>");
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    child_registry_entry_t *entry = find_or_allocate_locked(device_id);
+    if (entry == NULL) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NO_MEM;
+    }
+
+    (void)refresh_status_locked(entry, now_ms());
+    entry->last_seq = seq;
+    /* Passive status must neither clear nor extend link_lost/offline/heartbeat identity. */
     xSemaphoreGive(s_lock);
     return ESP_OK;
 }
@@ -222,11 +328,192 @@ esp_err_t child_registry_update_peer_ip(const char *device_id, const char *peer_
         return ESP_ERR_NO_MEM;
     }
     if (strcmp(entry->peer_ip, peer_ip) != 0) {
+        for (size_t i = 0; i < GATEWAY_CONFIG_MAX_CHILDREN; ++i) {
+            child_registry_entry_t *other = &s_entries[i];
+            if (other != entry && strcmp(other->peer_ip, peer_ip) == 0) {
+                other->peer_ip[0] = '\0';
+            }
+        }
         ESP_LOGI(TAG, "child peer mapped device_id=%s peer_ip=%s", device_id, peer_ip);
         strlcpy(entry->peer_ip, peer_ip, sizeof(entry->peer_ip));
     }
     xSemaphoreGive(s_lock);
     return ESP_OK;
+}
+
+bool child_registry_get_peer_ip(const char *device_id, char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0U) {
+        return false;
+    }
+    out[0] = '\0';
+    if (!child_registry_is_allowed(device_id) || s_lock == NULL) {
+        return false;
+    }
+
+    bool found = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    child_registry_entry_t *entry = find_locked(device_id);
+    if (entry != NULL && entry->peer_ip[0] != '\0') {
+        strlcpy(out, entry->peer_ip, out_size);
+        found = true;
+    }
+    xSemaphoreGive(s_lock);
+    return found;
+}
+
+bool child_registry_find_device_by_peer_ip(const char *peer_ip,
+                                           char *out_device_id,
+                                           size_t out_size)
+{
+    if (out_device_id == NULL || out_size == 0U) {
+        return false;
+    }
+    out_device_id[0] = '\0';
+    if (peer_ip == NULL || peer_ip[0] == '\0' || s_lock == NULL) {
+        return false;
+    }
+
+    bool found = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (size_t i = 0; i < GATEWAY_CONFIG_MAX_CHILDREN; ++i) {
+        const child_registry_entry_t *entry = &s_entries[i];
+        if (entry->device_id[0] == '\0' || entry->peer_ip[0] == '\0' ||
+            strcmp(entry->peer_ip, peer_ip) != 0) {
+            continue;
+        }
+        strlcpy(out_device_id, entry->device_id, out_size);
+        found = true;
+        break;
+    }
+    xSemaphoreGive(s_lock);
+    return found;
+}
+
+esp_err_t child_registry_update_peer_mac(
+    const char *device_id,
+    const uint8_t peer_mac[CHILD_REGISTRY_PEER_MAC_LEN])
+{
+    if (!child_registry_is_allowed(device_id)) {
+        ESP_LOGW(TAG,
+                 "peer mac update rejected device_id=%s reason=not_allowed",
+                 device_id != NULL ? device_id : "<null>");
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    if (!peer_mac_is_valid(peer_mac)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bool changed = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    child_registry_entry_t *entry = find_or_allocate_locked(device_id);
+    if (entry == NULL) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    for (size_t i = 0; i < GATEWAY_CONFIG_MAX_CHILDREN; ++i) {
+        child_registry_entry_t *other = &s_entries[i];
+        if (other != entry && other->peer_mac_valid &&
+            memcmp(other->peer_mac, peer_mac, CHILD_REGISTRY_PEER_MAC_LEN) == 0) {
+            memset(other->peer_mac, 0, sizeof(other->peer_mac));
+            other->peer_mac_valid = false;
+        }
+    }
+    if (!entry->peer_mac_valid ||
+        memcmp(entry->peer_mac, peer_mac, CHILD_REGISTRY_PEER_MAC_LEN) != 0) {
+        memcpy(entry->peer_mac, peer_mac, CHILD_REGISTRY_PEER_MAC_LEN);
+        entry->peer_mac_valid = true;
+        changed = true;
+    }
+    xSemaphoreGive(s_lock);
+
+    if (changed) {
+        ESP_LOGI(TAG,
+                 "child peer mac mapped device_id=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                 device_id,
+                 peer_mac[0],
+                 peer_mac[1],
+                 peer_mac[2],
+                 peer_mac[3],
+                 peer_mac[4],
+                 peer_mac[5]);
+    }
+    return ESP_OK;
+}
+
+bool child_registry_find_device_by_peer_mac(
+    const uint8_t peer_mac[CHILD_REGISTRY_PEER_MAC_LEN],
+    char *out_device_id,
+    size_t out_size)
+{
+    if (out_device_id == NULL || out_size == 0U) {
+        return false;
+    }
+    out_device_id[0] = '\0';
+    if (!peer_mac_is_valid(peer_mac) || s_lock == NULL) {
+        return false;
+    }
+
+    bool found = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (size_t i = 0; i < GATEWAY_CONFIG_MAX_CHILDREN; ++i) {
+        const child_registry_entry_t *entry = &s_entries[i];
+        if (entry->device_id[0] == '\0' || !entry->peer_mac_valid ||
+            memcmp(entry->peer_mac, peer_mac, CHILD_REGISTRY_PEER_MAC_LEN) != 0) {
+            continue;
+        }
+        strlcpy(out_device_id, entry->device_id, out_size);
+        found = true;
+        break;
+    }
+    xSemaphoreGive(s_lock);
+    return found;
+}
+
+static bool mark_link_lost_locked(child_registry_entry_t *entry, int64_t timestamp_ms)
+{
+    if (entry == NULL || entry->device_id[0] == '\0' || !entry->registered) {
+        return false;
+    }
+
+    const bool changed = entry->status != CHILD_REGISTRY_STATUS_LINK_LOST;
+    entry->status = CHILD_REGISTRY_STATUS_LINK_LOST;
+    entry->online = true;
+    if (timestamp_ms > entry->link_lost_since_ms) {
+        entry->link_lost_since_ms = timestamp_ms;
+    }
+    return changed;
+}
+
+void child_registry_mark_link_lost(const char *device_id, const char *reason)
+{
+    child_registry_mark_link_lost_at(device_id, now_ms(), reason);
+}
+
+void child_registry_mark_link_lost_at(const char *device_id,
+                                      int64_t disconnected_at_ms,
+                                      const char *reason)
+{
+    if (!child_registry_is_allowed(device_id) || s_lock == NULL) {
+        return;
+    }
+
+    bool changed = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    changed = mark_link_lost_locked(find_locked(device_id),
+                                    disconnected_at_ms > 0 ? disconnected_at_ms : now_ms());
+    xSemaphoreGive(s_lock);
+
+    if (changed) {
+        ESP_LOGI(TAG,
+                 "child registry link_lost device_id=%s reason=%s grace_ms=%u",
+                 device_id,
+                 reason != NULL ? reason : "<none>",
+                 (unsigned int)gateway_config_get()->link_lost_grace_ms);
+    }
 }
 
 void child_registry_mark_all_link_lost(const char *reason)
@@ -235,28 +522,25 @@ void child_registry_mark_all_link_lost(const char *reason)
         return;
     }
 
-    int64_t timestamp_ms = now_ms();
+    const int64_t timestamp_ms = now_ms();
+    size_t changed_count = 0U;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (size_t i = 0; i < GATEWAY_CONFIG_MAX_CHILDREN; i++) {
-        child_registry_entry_t *entry = &s_entries[i];
-        if (entry->device_id[0] == '\0' || !entry->registered ||
-            entry->status == CHILD_REGISTRY_STATUS_OFFLINE) {
-            continue;
-        }
         /*
          * AP_STADISCONNECTED 只能说明 WiFi 层断开，C5 可能在宽限期内重连并幂等 register。
          * 因此先标 link_lost，不删除 entry，超过 grace 后才转 offline。
          */
-        entry->status = CHILD_REGISTRY_STATUS_LINK_LOST;
-        entry->online = true;
-        entry->link_lost_since_ms = timestamp_ms;
+        if (mark_link_lost_locked(&s_entries[i], timestamp_ms)) {
+            ++changed_count;
+        }
     }
     xSemaphoreGive(s_lock);
 
     ESP_LOGI(TAG,
-             "child registry link_lost grace start reason=%s grace_ms=%u",
+             "child registry link_lost grace start reason=%s grace_ms=%u changed=%u",
              reason != NULL ? reason : "<none>",
-             (unsigned int)gateway_config_get()->link_lost_grace_ms);
+             (unsigned int)gateway_config_get()->link_lost_grace_ms,
+             (unsigned int)changed_count);
 }
 
 void child_registry_set_voice_busy(const char *device_id, bool busy)
@@ -268,10 +552,16 @@ void child_registry_set_voice_busy(const char *device_id, bool busy)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     child_registry_entry_t *entry = find_or_allocate_locked(device_id);
     if (entry != NULL) {
-        entry->last_seen_ms = now_ms();
-        entry->link_lost_since_ms = 0;
-        entry->online = true;
-        entry->status = busy ? CHILD_REGISTRY_STATUS_VOICE_BUSY : CHILD_REGISTRY_STATUS_ONLINE;
+        const int64_t timestamp_ms = now_ms();
+        const child_registry_status_t status = refresh_status_locked(entry, timestamp_ms);
+        if (status != CHILD_REGISTRY_STATUS_LINK_LOST &&
+            status != CHILD_REGISTRY_STATUS_OFFLINE) {
+            entry->last_seen_ms = timestamp_ms;
+            entry->link_lost_since_ms = 0;
+            entry->online = true;
+            entry->status = busy ? CHILD_REGISTRY_STATUS_VOICE_BUSY :
+                                   CHILD_REGISTRY_STATUS_ONLINE;
+        }
     }
     xSemaphoreGive(s_lock);
 }
@@ -299,6 +589,12 @@ static child_registry_status_t refresh_status_locked(child_registry_entry_t *ent
             return entry->status;
         }
         entry->status = CHILD_REGISTRY_STATUS_OFFLINE;
+        entry->online = false;
+        return entry->status;
+    }
+
+    if (entry->status == CHILD_REGISTRY_STATUS_OFFLINE &&
+        entry->link_lost_since_ms > 0) {
         entry->online = false;
         return entry->status;
     }
@@ -412,6 +708,39 @@ bool child_registry_get_status_info(const char *device_id, child_registry_status
         *out_status = status;
     }
     return found;
+}
+
+bool child_registry_get_status_view(const char *device_id,
+                                    child_registry_status_view_t *out_view)
+{
+    child_registry_status_view_t view;
+    set_default_status_view(&view);
+
+    if (s_lock == NULL) {
+        if (out_view != NULL) {
+            *out_view = view;
+        }
+        return false;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    child_registry_entry_t *entry = find_locked(device_id);
+    if (entry != NULL) {
+        const child_registry_status_t status = refresh_status_locked(entry, now_ms());
+        view.registered = entry->registered;
+        view.online = status_is_onlineish(status);
+        view.status = status;
+        view.last_seen_ms = entry->last_seen_ms;
+        view.link_lost = status == CHILD_REGISTRY_STATUS_LINK_LOST;
+        view.voice_busy = status == CHILD_REGISTRY_STATUS_VOICE_BUSY;
+        view.offline_reason = offline_reason_locked(entry, status);
+    }
+    xSemaphoreGive(s_lock);
+
+    if (out_view != NULL) {
+        *out_view = view;
+    }
+    return view.registered;
 }
 
 size_t child_registry_snapshot(child_registry_entry_t *entries, size_t entry_count)

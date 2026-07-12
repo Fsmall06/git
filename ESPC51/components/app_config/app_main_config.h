@@ -38,8 +38,8 @@
 #endif
 
 #ifndef CSI_REPORT_INTERVAL_MS
-/* CSI feature 输出周期，单位 ms；只输出 frame_energy/variance/rssi 等轻量特征。 */
-#define CSI_REPORT_INTERVAL_MS 1000U
+/* CSI edge feature 输出周期，单位 ms；callback 不执行算法，只投递处理事件。 */
+#define CSI_REPORT_INTERVAL_MS 100U
 #endif
 
 #ifndef CSI_SERVICE_REPORT_INTERVAL_MS
@@ -57,19 +57,34 @@
 #define CSI_OUTPUT_ENABLE_HTTP 1
 #endif
 
+#ifndef CSI_OUTPUT_ENABLE_DEBUG_METRICS
+/* CSI debug payload 开关：默认 HTTP payload 不携带 energy/variance/cv 或 legacy v。 */
+#define CSI_OUTPUT_ENABLE_DEBUG_METRICS 0
+#endif
+
 #ifndef CSI_ALGORITHM_VERSION
-/* CSI 边缘 feature 算法版本；状态决策只在 S3。 */
+/* CSI 边缘 feature 算法版本；C5 输出本地 IDLE/MOTION，S3 负责双链路融合。 */
 #define CSI_ALGORITHM_VERSION "edge_feature_v2"
 #endif
 
 #ifndef C5_SCHEDULER_TASK_STACK
-/* C5 scheduler 调用 system/BME/CSI tick，栈需覆盖 HTTP/JSON/传感器路径。 */
+/* C5 event dispatcher 栈；业务 HTTP/JSON/传感器路径在 worker 中执行。 */
 #define C5_SCHEDULER_TASK_STACK 12288U
 #endif
 
 #ifndef C5_SCHEDULER_TASK_PRIORITY
-/* Scheduler 低于 voice/audio/wifi/gateway_link，高于普通空闲启动任务。 */
-#define C5_SCHEDULER_TASK_PRIORITY 2U
+/* C5 event dispatcher 优先级；voice/audio 仍保持独立高优先级链路。 */
+#define C5_SCHEDULER_TASK_PRIORITY 4U
+#endif
+
+#ifndef C5_WORKER_TASK_STACK
+/* C5 CSI/BME/system worker 栈；覆盖各自 HTTP/JSON/传感器业务路径。 */
+#define C5_WORKER_TASK_STACK 8192U
+#endif
+
+#ifndef C5_WORKER_TASK_PRIORITY
+/* C5 CSI/BME/system worker 优先级，低于 dispatcher 与 voice/audio 链路。 */
+#define C5_WORKER_TASK_PRIORITY 3U
 #endif
 
 #ifndef MAIN_SPEAKER_SELF_TEST_DURATION_MS
@@ -120,12 +135,16 @@
 #error "CSI_OUTPUT_ENABLE_HTTP must be 0 or 1"
 #endif
 
+#if CSI_OUTPUT_ENABLE_DEBUG_METRICS != 0 && CSI_OUTPUT_ENABLE_DEBUG_METRICS != 1
+#error "CSI_OUTPUT_ENABLE_DEBUG_METRICS must be 0 or 1"
+#endif
+
 #if MAIN_SPEAKER_SELF_TEST_DURATION_MS <= 0
 #error "MAIN_SPEAKER_SELF_TEST_DURATION_MS must be greater than 0"
 #endif
 
-#if CSI_SERVICE_REPORT_INTERVAL_MS < 1000
-#error "CSI_SERVICE_REPORT_INTERVAL_MS must be at least 1000"
+#if CSI_SERVICE_REPORT_INTERVAL_MS < 100
+#error "CSI_SERVICE_REPORT_INTERVAL_MS must be at least 100ms"
 #endif
 
 #if C5_SCHEDULER_TASK_STACK < 8192
@@ -134,6 +153,14 @@
 
 #if C5_SCHEDULER_TASK_PRIORITY <= 0
 #error "C5_SCHEDULER_TASK_PRIORITY must be greater than 0"
+#endif
+
+#if C5_WORKER_TASK_STACK < 6144
+#error "C5_WORKER_TASK_STACK must be at least 6144"
+#endif
+
+#if C5_WORKER_TASK_PRIORITY <= 0
+#error "C5_WORKER_TASK_PRIORITY must be greater than 0"
 #endif
 
 #if APP_STARTUP_TASK_STACK < 8192
