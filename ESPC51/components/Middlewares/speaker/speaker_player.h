@@ -1,6 +1,7 @@
 #ifndef SPEAKER_PLAYER_H
 #define SPEAKER_PLAYER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -157,6 +158,15 @@ esp_err_t audio_player_stream_finish(void);
  * 未打开流时直接返回 ESP_OK。
  */
 esp_err_t audio_player_stream_abort(void);
+
+/**
+ * @brief Return the published PCM-to-I2S activity snapshot.
+ *
+ * The value becomes true only after the writer task has successfully handed
+ * PCM bytes to IIS/DMA, and becomes false after that task stops IIS. It does
+ * not expose or lock any speaker resources, so status consumers may read it.
+ */
+bool audio_player_is_speaker_active(void);
 
 /**
  * @brief Release the inactive speaker session after a bounded receiver/drain shutdown.

@@ -110,6 +110,7 @@ static bool app_lcd_dashboard_snapshot(lcd_dashboard_snapshot_t *out_snapshot, v
         .network_ok = gateway_link_wifi_is_stable(),
         .gateway_ok = gateway_link_is_ready(),
         .voice_state = app_lcd_voice_state(voice_chain_get_state()),
+        .speaker_active = audio_player_is_speaker_active(),
     };
     return true;
 }

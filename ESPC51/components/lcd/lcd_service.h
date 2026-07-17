@@ -45,6 +45,8 @@ typedef struct {
     bool network_ok;
     bool gateway_ok;
     lcd_dashboard_voice_state_t voice_state;
+    /* Published audio-output edge; the LCD uses it only for the cat mouth. */
+    bool speaker_active;
 } lcd_dashboard_snapshot_t;
 
 /** Called from the LVGL timer task to copy already-published state only. */

@@ -18,7 +18,8 @@
 #define LCD_LVGL_TASK_STACK 4096
 #define LCD_LVGL_TIMER_PERIOD_MS 20
 #define LCD_LVGL_MEM_LOG_PERIOD_MS 30000U
-#define LCD_DASHBOARD_REFRESH_MS 1000U
+#define LCD_DASHBOARD_SNAPSHOT_REFRESH_MS 100U
+#define LCD_DASHBOARD_DATA_REFRESH_MS 1000LL
 #define LCD_DASHBOARD_LOG_PERIOD_MS 10000LL
 #define LCD_DASHBOARD_MARGIN_X 12
 #define LCD_DASHBOARD_TEXT_WIDTH (LCD_H_RES - (LCD_DASHBOARD_MARGIN_X * 2))
@@ -34,6 +35,8 @@
                                   (LCD_CAT_IMAGE_STRIDE * LCD_CAT_IMAGE_HEIGHT))
 #define LCD_CAT_IMAGE_X 88
 #define LCD_CAT_IMAGE_Y 172
+#define LCD_VOICE_CAT_IMAGE_X 88
+#define LCD_VOICE_CAT_IMAGE_Y 104
 
 static const char *TAG = "LCD_LVGL";
 static const char *MEM_TAG = "LVGL_MEM";
@@ -46,8 +49,12 @@ static lv_obj_t *s_gas_label;
 static lv_obj_t *s_air_label;
 static lv_obj_t *s_network_label;
 static lv_obj_t *s_voice_label;
+static lv_obj_t *s_dashboard_root;
+static lv_obj_t *s_voice_root;
 static lv_obj_t *s_cat_image;
 static lv_timer_t *s_cat_animation_timer;
+static lv_obj_t *s_voice_cat_image;
+static lv_timer_t *s_voice_animation_timer;
 static char s_temp_text[32];
 static char s_humidity_text[32];
 static char s_pressure_text[32];
@@ -58,17 +65,28 @@ static char s_voice_text[32];
 static lcd_dashboard_snapshot_provider_t s_snapshot_provider;
 static void *s_snapshot_provider_ctx;
 static int64_t s_last_dashboard_log_ms;
+static int64_t s_last_dashboard_data_update_ms;
 static portMUX_TYPE s_snapshot_provider_lock = portMUX_INITIALIZER_UNLOCKED;
 static lcd_dashboard_voice_state_t s_cat_voice_state;
 static uint8_t s_cat_animation_frame;
 static uint8_t s_cat_play_frame;
 static bool s_cat_voice_state_valid;
 static bool s_cat_play_mouth_open;
+static bool s_cat_speaker_active;
 static bool s_cat_disabled;
 static const lv_image_dsc_t *s_cat_frame;
+static lcd_dashboard_voice_state_t s_voice_ui_state;
+static const lv_image_dsc_t *s_voice_cat_frame;
+static uint8_t s_voice_animation_frame;
+static uint8_t s_voice_play_frame;
+static bool s_voice_play_mouth_open;
+static bool s_voice_speaker_active;
+static bool s_voice_ui_visible;
+static bool s_voice_ui_disabled;
 
 static void lcd_lvgl_log_memory(const char *stage);
 static void lcd_cat_animation_timer_cb(lv_timer_t *timer);
+static void lcd_voice_animation_timer_cb(lv_timer_t *timer);
 
 static lv_obj_t *lcd_lvgl_create_label(lv_obj_t *parent,
                                         const char *text,
@@ -384,7 +402,7 @@ static void lcd_cat_animation_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    if (s_cat_voice_state == LCD_DASHBOARD_VOICE_PLAY) {
+    if (s_cat_speaker_active) {
         s_cat_play_frame++;
         if (s_cat_play_frame >= LCD_CAT_PLAY_MOUTH_PERIOD_FRAMES) {
             s_cat_play_frame = 0;
@@ -397,39 +415,254 @@ static void lcd_cat_animation_timer_cb(lv_timer_t *timer)
     lv_timer_pause(timer);
 }
 
-static void lcd_cat_update_for_voice_state(lcd_dashboard_voice_state_t state)
+static void lcd_cat_update_for_voice_state(lcd_dashboard_voice_state_t state,
+                                           bool speaker_active)
 {
     if (s_cat_disabled || s_cat_image == NULL) {
         return;
     }
-    if (s_cat_voice_state_valid && s_cat_voice_state == state) {
-        return;
+
+    if (!s_cat_voice_state_valid || s_cat_voice_state != state) {
+        s_cat_voice_state = state;
+        s_cat_voice_state_valid = true;
+        s_cat_animation_frame = 0;
+        s_cat_play_frame = 0;
+        s_cat_play_mouth_open = false;
+        lcd_cat_apply_static_state(state);
+        if (s_cat_animation_timer == NULL) {
+            return;
+        }
+
+        if (state == LCD_DASHBOARD_VOICE_WAKE) {
+            lcd_cat_set_frame(&s_cat_open, 0, -2);
+            lv_timer_resume(s_cat_animation_timer);
+        } else if (state == LCD_DASHBOARD_VOICE_REC && !speaker_active) {
+            lv_timer_resume(s_cat_animation_timer);
+        } else {
+            lv_timer_pause(s_cat_animation_timer);
+        }
     }
 
-    s_cat_voice_state = state;
-    s_cat_voice_state_valid = true;
-    s_cat_animation_frame = 0;
+    if (s_cat_speaker_active == speaker_active || s_cat_animation_timer == NULL) {
+        return;
+    }
+    s_cat_speaker_active = speaker_active;
     s_cat_play_frame = 0;
-    s_cat_play_mouth_open = false;
-    lcd_cat_apply_static_state(state);
-    if (s_cat_animation_timer == NULL) {
-        return;
-    }
-
-    if (state == LCD_DASHBOARD_VOICE_WAKE) {
-        lcd_cat_set_frame(&s_cat_open, 0, -2);
+    if (speaker_active) {
+        s_cat_play_mouth_open = true;
+        lcd_cat_set_frame(&s_cat_play, 0, 0);
         lv_timer_resume(s_cat_animation_timer);
-    } else if (state == LCD_DASHBOARD_VOICE_REC ||
-               state == LCD_DASHBOARD_VOICE_PLAY) {
-        lv_timer_resume(s_cat_animation_timer);
+        ESP_LOGI(TAG, "LCD_CAT_AUDIO_SYNC start");
     } else {
         lv_timer_pause(s_cat_animation_timer);
+        if (s_cat_voice_state == LCD_DASHBOARD_VOICE_PLAY) {
+            s_cat_play_mouth_open = false;
+            lcd_cat_set_frame(&s_cat_open, 0, 0);
+        }
+        ESP_LOGI(TAG, "LCD_CAT_AUDIO_SYNC stop");
     }
 }
 
-static void lcd_lvgl_update_dashboard(const lcd_dashboard_snapshot_t *snapshot)
+static lv_obj_t *lcd_lvgl_create_root(lv_obj_t *screen, bool opaque)
+{
+    lv_obj_t *root = lv_obj_create(screen);
+    if (root == NULL) {
+        return NULL;
+    }
+    lv_obj_set_pos(root, 0, 0);
+    lv_obj_set_size(root, LCD_H_RES, LCD_V_RES);
+    lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_border_width(root, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(root, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(root, lv_color_hex(0x101820), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(root, opaque ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
+    return root;
+}
+
+static void lcd_voice_ui_disable(void)
+{
+    if (s_voice_animation_timer != NULL) {
+        lv_timer_delete(s_voice_animation_timer);
+        s_voice_animation_timer = NULL;
+    }
+    if (s_voice_root != NULL) {
+        lv_obj_delete(s_voice_root);
+        s_voice_root = NULL;
+    }
+    s_voice_cat_image = NULL;
+    s_voice_cat_frame = NULL;
+    s_voice_ui_visible = false;
+    s_voice_ui_disabled = true;
+    ESP_LOGE(TAG, "LCD_VOICE_UI_DISABLED reason=allocation_failed");
+}
+
+static void lcd_voice_ui_set_frame(const lv_image_dsc_t *frame, int16_t offset_x)
+{
+    if (s_voice_cat_image == NULL || frame == NULL) {
+        return;
+    }
+    if (s_voice_cat_frame != frame) {
+        lv_image_set_src(s_voice_cat_image, frame);
+        s_voice_cat_frame = frame;
+    }
+    lv_obj_set_pos(s_voice_cat_image, LCD_VOICE_CAT_IMAGE_X + offset_x, LCD_VOICE_CAT_IMAGE_Y);
+}
+
+static void lcd_voice_ui_apply_state(lcd_dashboard_voice_state_t state)
+{
+    switch (state) {
+    case LCD_DASHBOARD_VOICE_WAKE:
+        lcd_voice_ui_set_frame(&s_cat_listen, 0);
+        break;
+    case LCD_DASHBOARD_VOICE_REC:
+        lcd_voice_ui_set_frame(&s_cat_rec, 0);
+        break;
+    case LCD_DASHBOARD_VOICE_WAIT:
+        lcd_voice_ui_set_frame(&s_cat_open, 0);
+        break;
+    case LCD_DASHBOARD_VOICE_PLAY:
+        lcd_voice_ui_set_frame(&s_cat_open, 0);
+        break;
+    case LCD_DASHBOARD_VOICE_ERR:
+        lcd_voice_ui_set_frame(&s_cat_error, 0);
+        break;
+    case LCD_DASHBOARD_VOICE_LISTEN:
+    default:
+        break;
+    }
+}
+
+static bool lcd_voice_ui_create(lv_obj_t *screen)
+{
+    s_voice_ui_disabled = false;
+    s_voice_root = lcd_lvgl_create_root(screen, true);
+    if (s_voice_root == NULL) {
+        lcd_voice_ui_disable();
+        return false;
+    }
+    s_voice_cat_image = lv_image_create(s_voice_root);
+    if (s_voice_cat_image == NULL) {
+        lcd_voice_ui_disable();
+        return false;
+    }
+    s_voice_cat_frame = NULL;
+    lcd_voice_ui_set_frame(&s_cat_listen, 0);
+    s_voice_animation_timer = lv_timer_create(lcd_voice_animation_timer_cb,
+                                               LCD_CAT_ANIMATION_PERIOD_MS,
+                                               NULL);
+    if (s_voice_animation_timer == NULL) {
+        lcd_voice_ui_disable();
+        return false;
+    }
+    lv_timer_pause(s_voice_animation_timer);
+    lv_obj_add_flag(s_voice_root, LV_OBJ_FLAG_HIDDEN);
+    return true;
+}
+
+static void lcd_voice_animation_timer_cb(lv_timer_t *timer)
+{
+    if (s_voice_ui_disabled || !s_voice_ui_visible || timer == NULL) {
+        if (timer != NULL) {
+            lv_timer_pause(timer);
+        }
+        return;
+    }
+    if (s_voice_ui_state == LCD_DASHBOARD_VOICE_REC) {
+        s_voice_animation_frame++;
+        if (s_voice_animation_frame >= LCD_CAT_RECORDING_FRAMES) {
+            lcd_voice_ui_set_frame(&s_cat_rec, 0);
+            lv_timer_pause(timer);
+            return;
+        }
+        lcd_voice_ui_set_frame(&s_cat_rec, (s_voice_animation_frame & 1U) != 0U ? 1 : 0);
+        return;
+    }
+    if (s_voice_speaker_active) {
+        s_voice_play_frame++;
+        if (s_voice_play_frame >= LCD_CAT_PLAY_MOUTH_PERIOD_FRAMES) {
+            s_voice_play_frame = 0;
+            s_voice_play_mouth_open = !s_voice_play_mouth_open;
+            lcd_voice_ui_set_frame(s_voice_play_mouth_open ? &s_cat_play : &s_cat_open, 0);
+        }
+        return;
+    }
+    lv_timer_pause(timer);
+}
+
+static void lcd_voice_ui_update(lcd_dashboard_voice_state_t state, bool speaker_active)
+{
+    const bool active = state != LCD_DASHBOARD_VOICE_LISTEN;
+    if (s_voice_ui_disabled || s_voice_root == NULL || s_dashboard_root == NULL) {
+        return;
+    }
+    if (!active) {
+        if (s_voice_ui_visible) {
+            lv_timer_pause(s_voice_animation_timer);
+            lv_obj_add_flag(s_voice_root, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_dashboard_root, LV_OBJ_FLAG_HIDDEN);
+            s_voice_ui_visible = false;
+            ESP_LOGI(TAG, "LCD_UI_MODE voice->dashboard reason=voice_listen");
+        }
+        if (s_voice_speaker_active) {
+            ESP_LOGI(TAG, "LCD_CAT_AUDIO_SYNC stop");
+        }
+        s_voice_ui_state = LCD_DASHBOARD_VOICE_LISTEN;
+        s_voice_speaker_active = false;
+        return;
+    }
+
+    if (!s_voice_ui_visible) {
+        lv_timer_pause(s_cat_animation_timer);
+        lv_obj_add_flag(s_dashboard_root, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_voice_root, LV_OBJ_FLAG_HIDDEN);
+        s_voice_ui_visible = true;
+        ESP_LOGI(TAG, "LCD_UI_MODE dashboard->voice generation=state_snapshot");
+    }
+    if (s_voice_ui_state != state) {
+        s_voice_ui_state = state;
+        s_voice_animation_frame = 0;
+        s_voice_play_frame = 0;
+        s_voice_play_mouth_open = false;
+        lcd_voice_ui_apply_state(state);
+        if (state == LCD_DASHBOARD_VOICE_REC && !speaker_active) {
+            lv_timer_resume(s_voice_animation_timer);
+        } else {
+            lv_timer_pause(s_voice_animation_timer);
+        }
+    }
+
+    if (s_voice_speaker_active == speaker_active) {
+        return;
+    }
+    s_voice_speaker_active = speaker_active;
+    s_voice_play_frame = 0;
+    if (speaker_active) {
+        s_voice_play_mouth_open = true;
+        lcd_voice_ui_set_frame(&s_cat_play, 0);
+        lv_timer_resume(s_voice_animation_timer);
+        ESP_LOGI(TAG, "LCD_CAT_AUDIO_SYNC start");
+    } else {
+        lv_timer_pause(s_voice_animation_timer);
+        if (s_voice_ui_state == LCD_DASHBOARD_VOICE_PLAY) {
+            s_voice_play_mouth_open = false;
+            lcd_voice_ui_set_frame(&s_cat_open, 0);
+        }
+        ESP_LOGI(TAG, "LCD_CAT_AUDIO_SYNC stop");
+    }
+}
+
+static void lcd_lvgl_update_dashboard(const lcd_dashboard_snapshot_t *snapshot,
+                                      bool update_dashboard_data)
 {
     if (snapshot == NULL) {
+        return;
+    }
+
+    lcd_voice_ui_update(snapshot->voice_state, snapshot->speaker_active);
+    if (!s_voice_ui_visible) {
+        lcd_cat_update_for_voice_state(snapshot->voice_state, snapshot->speaker_active);
+    }
+    if (!update_dashboard_data) {
         return;
     }
 
@@ -463,7 +696,6 @@ static void lcd_lvgl_update_dashboard(const lcd_dashboard_snapshot_t *snapshot)
     lcd_lvgl_set_static_text(s_air_label, s_air_text);
     lcd_lvgl_set_static_text(s_network_label, s_network_text);
     lcd_lvgl_set_static_text(s_voice_label, s_voice_text);
-    lcd_cat_update_for_voice_state(snapshot->voice_state);
 }
 
 /* This callback runs in the LVGL task. The provider copies only already-published snapshots. */
@@ -483,9 +715,15 @@ static void lcd_lvgl_dashboard_timer_cb(lv_timer_t *timer)
     if (provider != NULL) {
         (void)provider(&snapshot, provider_ctx);
     }
-    lcd_lvgl_update_dashboard(&snapshot);
-
     const int64_t now_ms = esp_timer_get_time() / 1000;
+    const bool update_dashboard_data = s_last_dashboard_data_update_ms == 0 ||
+                                       now_ms - s_last_dashboard_data_update_ms >=
+                                           LCD_DASHBOARD_DATA_REFRESH_MS;
+    if (update_dashboard_data) {
+        s_last_dashboard_data_update_ms = now_ms;
+    }
+    lcd_lvgl_update_dashboard(&snapshot, update_dashboard_data);
+
     if (s_last_dashboard_log_ms == 0 ||
         now_ms - s_last_dashboard_log_ms >= LCD_DASHBOARD_LOG_PERIOD_MS) {
         s_last_dashboard_log_ms = now_ms;
@@ -552,18 +790,24 @@ static esp_err_t lcd_lvgl_create_status_ui(void)
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x101820), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 
+    s_dashboard_root = lcd_lvgl_create_root(screen, false);
+    if (s_dashboard_root == NULL) {
+        lvgl_port_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+
     const lv_color_t title_color = lv_color_hex(0xFFFFFF);
     const lv_color_t section_color = lv_color_hex(0x79D2A6);
     const lv_color_t value_color = lv_color_hex(0xDCE7EF);
-    lv_obj_t *title = lcd_lvgl_create_label(screen, "SensAir C5", title_color, 12);
-    lv_obj_t *environment = lcd_lvgl_create_label(screen, "ENVIRONMENT", section_color, 40);
-    s_temp_label = lcd_lvgl_create_label(screen, s_temp_text, value_color, 60);
-    s_humidity_label = lcd_lvgl_create_label(screen, s_humidity_text, value_color, 82);
-    s_pressure_label = lcd_lvgl_create_label(screen, s_pressure_text, value_color, 104);
-    s_gas_label = lcd_lvgl_create_label(screen, s_gas_text, value_color, 126);
-    s_air_label = lcd_lvgl_create_label(screen, s_air_text, section_color, 148);
-    s_network_label = lcd_lvgl_create_label(screen, s_network_text, section_color, 238);
-    s_voice_label = lcd_lvgl_create_label(screen, s_voice_text, title_color, 258);
+    lv_obj_t *title = lcd_lvgl_create_label(s_dashboard_root, "SensAir C5", title_color, 12);
+    lv_obj_t *environment = lcd_lvgl_create_label(s_dashboard_root, "ENVIRONMENT", section_color, 40);
+    s_temp_label = lcd_lvgl_create_label(s_dashboard_root, s_temp_text, value_color, 60);
+    s_humidity_label = lcd_lvgl_create_label(s_dashboard_root, s_humidity_text, value_color, 82);
+    s_pressure_label = lcd_lvgl_create_label(s_dashboard_root, s_pressure_text, value_color, 104);
+    s_gas_label = lcd_lvgl_create_label(s_dashboard_root, s_gas_text, value_color, 126);
+    s_air_label = lcd_lvgl_create_label(s_dashboard_root, s_air_text, section_color, 148);
+    s_network_label = lcd_lvgl_create_label(s_dashboard_root, s_network_text, section_color, 238);
+    s_voice_label = lcd_lvgl_create_label(s_dashboard_root, s_voice_text, title_color, 258);
     if (title == NULL || environment == NULL || s_temp_label == NULL || s_humidity_label == NULL ||
         s_pressure_label == NULL || s_gas_label == NULL || s_air_label == NULL ||
         s_network_label == NULL || s_voice_label == NULL) {
@@ -572,23 +816,30 @@ static esp_err_t lcd_lvgl_create_status_ui(void)
     }
 
     lcd_lvgl_log_memory("before_cat_create");
-    (void)lcd_cat_create(screen);
+    (void)lcd_cat_create(s_dashboard_root);
     lcd_lvgl_log_memory("after_cat_create");
+    lcd_lvgl_log_memory("before_voice_ui_create");
+    (void)lcd_voice_ui_create(screen);
+    lcd_lvgl_log_memory("after_voice_ui_create");
 
     lcd_dashboard_snapshot_t initial_snapshot = {
         .voice_state = LCD_DASHBOARD_VOICE_LISTEN,
     };
-    lcd_lvgl_update_dashboard(&initial_snapshot);
+    lcd_lvgl_update_dashboard(&initial_snapshot, true);
 
     lcd_lvgl_log_memory("before_first_refresh");
+    lcd_lvgl_log_memory("before_first_voice_refresh");
     /* The display intentionally keeps a one-line partial DMA buffer. Invalidate the
      * complete screen once after the layout is built, then render it synchronously so
      * the panel's old PRESENCE area is overwritten by the background immediately. */
     lv_obj_invalidate(screen);
     lv_refr_now(s_display);
     lcd_lvgl_log_memory("after_first_refresh");
+    lcd_lvgl_log_memory("after_first_voice_refresh");
 
-    if (lv_timer_create(lcd_lvgl_dashboard_timer_cb, LCD_DASHBOARD_REFRESH_MS, NULL) == NULL) {
+    if (lv_timer_create(lcd_lvgl_dashboard_timer_cb,
+                        LCD_DASHBOARD_SNAPSHOT_REFRESH_MS,
+                        NULL) == NULL) {
         ESP_LOGE(TAG, "dashboard timer creation failed");
         lvgl_port_unlock();
         return ESP_ERR_NO_MEM;

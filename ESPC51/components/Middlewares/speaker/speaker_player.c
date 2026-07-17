@@ -147,6 +147,8 @@ typedef struct {
 static audio_player_stream_ctx_t s_pcm_stream_ctx = {0};
 static audio_player_deferred_diag_t s_deferred_diag = {0};
 static bool s_pcm_stream_open;
+/* Published by the sole IIS writer; status readers never touch speaker resources. */
+static bool s_speaker_active;
 static TaskHandle_t s_pcm_stream_owner_task;
 static uint32_t s_pcm_stream_sequence;
 static audio_player_state_t s_pcm_player_state = AUDIO_PLAYER_STATE_UNINITIALIZED;
@@ -380,6 +382,8 @@ static esp_err_t speaker_player_write_bytes_dma_streaming(audio_player_stream_ct
         speaker_player_dma_diag_record(bytes_left, bytes_written, elapsed_us);
 
         if (bytes_written > 0) {
+            /* This is the first point at which PCM has reached IIS/DMA. */
+            __atomic_store_n(&s_speaker_active, true, __ATOMIC_RELEASE);
             offset += bytes_written;
             chunk_written_bytes += bytes_written;
             ctx->dma_bytes_written += bytes_written;
@@ -563,6 +567,7 @@ static void speaker_player_writer_complete_turn(audio_player_stream_ctx_t *ctx,
 
     /* The persistent writer owns the per-turn I2S disable transition. */
     (void)iis_stop();
+    __atomic_store_n(&s_speaker_active, false, __ATOMIC_RELEASE);
     ctx->result = result;
     ctx->writer_stack_high_water_bytes = app_stack_monitor_high_water();
     ctx->writer_done = true;
@@ -896,6 +901,7 @@ static void speaker_player_reset_turn_locked(audio_player_stream_ctx_t *ctx)
     ctx->ring_high_water = 0;
     ctx->ring_backpressure_count = 0;
     s_pcm_stream_open = false;
+    __atomic_store_n(&s_speaker_active, false, __ATOMIC_RELEASE);
     s_pcm_stream_owner_task = NULL;
     s_pcm_stream_sequence = 0;
     s_pcm_player_state = AUDIO_PLAYER_STATE_READY_DISABLED;
@@ -1130,6 +1136,11 @@ esp_err_t audio_player_stream_abort(void)
     speaker_player_reset_turn_locked(&s_pcm_stream_ctx);
     xSemaphoreGive(s_play_mutex);
     return err;
+}
+
+bool audio_player_is_speaker_active(void)
+{
+    return __atomic_load_n(&s_speaker_active, __ATOMIC_ACQUIRE);
 }
 
 esp_err_t audio_player_release_session(uint32_t timeout_ms)
