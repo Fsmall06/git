@@ -42,6 +42,10 @@ yarn-error.log*
 # ESP-IDF build outputs
 build/
 **/build/
+build-*/
+**/build-*/
+.cache/
+**/.cache/
 *.o
 *.a
 *.out
@@ -50,7 +54,6 @@ build/
 *.elf
 *.map
 flasher_args.json
-sdkconfig
 sdkconfig.old
 compile_commands.json
 CMakeCache.txt
@@ -60,14 +63,13 @@ install_manifest.txt
 CTestTestfile.cmake
 
 # ESP-IDF downloaded/generated dependencies
-managed_components/
-**/managed_components/
 components/.idf/
 **/components/.idf/
 .espressif/
 
 # Python local artifacts
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd

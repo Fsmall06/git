@@ -70,6 +70,12 @@ static c5_scheduled_task_t s_scheduler_timers[] = {
 static portMUX_TYPE s_backpressure_lock = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_dispatcher_task;
 static uint64_t s_last_diagnostic_log_ms;
+static c5_lifecycle_state_t s_scheduler_state = C5_LIFECYCLE_STOPPED;
+static esp_err_t s_scheduler_primary_error = ESP_OK;
+static esp_err_t s_scheduler_workers_cleanup_error = ESP_OK;
+static esp_err_t s_scheduler_event_bus_cleanup_error = ESP_OK;
+static esp_err_t s_scheduler_cleanup_error = ESP_OK;
+static portMUX_TYPE s_scheduler_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* 只使用 esp_timer uptime；C5 不依赖 Server 时间来驱动本地调度。 */
 static uint64_t c5_scheduler_now_ms(void)
@@ -407,21 +413,73 @@ static void c5_event_dispatcher_task(void *arg)
     }
 }
 
+static esp_err_t c5_scheduler_rollback(esp_err_t start_ret)
+{
+    c5_lifecycle_state_t rollback_state;
+
+    portENTER_CRITICAL(&s_scheduler_state_lock);
+    rollback_state = s_scheduler_state;
+    if (s_scheduler_state == C5_LIFECYCLE_STARTING) {
+        s_scheduler_state = C5_LIFECYCLE_STOPPING;
+    }
+    portEXIT_CRITICAL(&s_scheduler_state_lock);
+
+    if (rollback_state != C5_LIFECYCLE_STARTING) {
+        ESP_LOGE(TAG,
+                 "scheduler rollback expected STARTING state, got %d",
+                 (int)rollback_state);
+    }
+
+    esp_err_t workers_cleanup_ret = c5_runtime_workers_stop();
+    esp_err_t event_bus_cleanup_ret = c5_event_bus_deinit();
+    esp_err_t cleanup_ret = workers_cleanup_ret != ESP_OK ?
+                            workers_cleanup_ret : event_bus_cleanup_ret;
+
+    portENTER_CRITICAL(&s_scheduler_state_lock);
+    s_scheduler_primary_error = start_ret;
+    s_scheduler_workers_cleanup_error = workers_cleanup_ret;
+    s_scheduler_event_bus_cleanup_error = event_bus_cleanup_ret;
+    s_scheduler_cleanup_error = cleanup_ret;
+    s_scheduler_state = cleanup_ret == ESP_OK ? C5_LIFECYCLE_STOPPED : C5_LIFECYCLE_FAULT;
+    portEXIT_CRITICAL(&s_scheduler_state_lock);
+
+    ESP_LOGE(TAG,
+             "scheduler startup rollback primary_error=%s workers_cleanup_error=%s "
+             "event_bus_cleanup_error=%s cleanup_error=%s",
+             esp_err_to_name(start_ret),
+             esp_err_to_name(workers_cleanup_ret),
+             esp_err_to_name(event_bus_cleanup_ret),
+             esp_err_to_name(cleanup_ret));
+    return cleanup_ret == ESP_OK ? start_ret : cleanup_ret;
+}
+
 esp_err_t c5_scheduler_start(void)
 {
-    if (s_dispatcher_task != NULL) {
+    portENTER_CRITICAL(&s_scheduler_state_lock);
+    if (s_scheduler_state == C5_LIFECYCLE_RUNNING) {
+        portEXIT_CRITICAL(&s_scheduler_state_lock);
         return ESP_OK;
     }
+    if (s_scheduler_state != C5_LIFECYCLE_STOPPED || s_dispatcher_task != NULL) {
+        portEXIT_CRITICAL(&s_scheduler_state_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_scheduler_state = C5_LIFECYCLE_STARTING;
+    s_scheduler_primary_error = ESP_OK;
+    s_scheduler_workers_cleanup_error = ESP_OK;
+    s_scheduler_event_bus_cleanup_error = ESP_OK;
+    s_scheduler_cleanup_error = ESP_OK;
+    portEXIT_CRITICAL(&s_scheduler_state_lock);
 
     esp_err_t ret = c5_event_bus_init();
     if (ret != ESP_OK) {
-        return ret;
+        return c5_scheduler_rollback(ret);
     }
 
     ret = c5_runtime_workers_start();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "start C5 workers failed: %s", esp_err_to_name(ret));
-        return ret;
+        return c5_scheduler_rollback(ret);
     }
 
     BaseType_t created = xTaskCreate(c5_event_dispatcher_task,
@@ -433,7 +491,11 @@ esp_err_t c5_scheduler_start(void)
     if (created != pdPASS) {
         s_dispatcher_task = NULL;
         ESP_LOGE(TAG, "create C5 event dispatcher task failed");
-        return ESP_ERR_NO_MEM;
+        return c5_scheduler_rollback(ESP_ERR_NO_MEM);
     }
+
+    portENTER_CRITICAL(&s_scheduler_state_lock);
+    s_scheduler_state = C5_LIFECYCLE_RUNNING;
+    portEXIT_CRITICAL(&s_scheduler_state_lock);
     return ESP_OK;
 }

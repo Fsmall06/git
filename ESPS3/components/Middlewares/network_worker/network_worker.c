@@ -42,6 +42,7 @@
 #include "sensor_aggregator.h"
 #include "server_client.h"
 #include "smart_home_gateway.h"
+#include "voice_proxy.h"
 
 static const char *TAG = "network_worker";
 
@@ -107,6 +108,14 @@ static const char *TAG = "network_worker";
 
 #ifndef NETWORK_WORKER_STA_LONG_DISCONNECTED_SCAN_MS
 #define NETWORK_WORKER_STA_LONG_DISCONNECTED_SCAN_MS 15000U
+#endif
+
+#ifndef NETWORK_WORKER_STA_SCAN_DEFER_RETRY_MS
+#define NETWORK_WORKER_STA_SCAN_DEFER_RETRY_MS 250U
+#endif
+
+#ifndef NETWORK_WORKER_STA_SCAN_DEFER_LOG_MS
+#define NETWORK_WORKER_STA_SCAN_DEFER_LOG_MS 5000U
 #endif
 
 #ifndef NETWORK_WORKER_PENDING_STATION_TTL_MS
@@ -240,6 +249,7 @@ static int64_t s_next_sta_scan_ms;
 static int64_t s_sta_scan_deadline_ms;
 static int64_t s_sta_last_scan_start_ms;
 static int64_t s_sta_disconnected_since_ms;
+static int64_t s_last_sta_scan_defer_log_ms;
 static char s_sta_scan_reason[32];
 static char s_command_ack_response[SERVER_CLIENT_SMALL_BODY_BYTES];
 static bool s_local_ingest_ready;
@@ -349,6 +359,8 @@ static const char *event_name(network_worker_event_t event)
         return "IP_READY";
     case NETWORK_WORKER_EVENT_SCAN_DONE:
         return "SCAN_DONE";
+    case NETWORK_WORKER_EVENT_LOCAL_HTTP_ACTIVE:
+        return "LOCAL_HTTP_ACTIVE";
     default:
         return "UNKNOWN";
     }
@@ -381,6 +393,8 @@ static const char *source_name(network_worker_event_source_t source)
         return "sta_scan_done";
     case NETWORK_WORKER_SOURCE_LOCAL_HTTP_ENABLE:
         return "local_http_enable";
+    case NETWORK_WORKER_SOURCE_LOCAL_HTTP_ACTIVE:
+        return "local_http_active";
     case NETWORK_WORKER_SOURCE_UNKNOWN:
     default:
         return "unknown";
@@ -1702,6 +1716,62 @@ static void schedule_sta_scan(bool avoid_current, uint32_t delay_ms, const char 
             sizeof(s_sta_scan_reason));
 }
 
+static bool sta_scan_defer_log_due(void)
+{
+    const int64_t timestamp_ms = now_ms();
+    if (s_last_sta_scan_defer_log_ms != 0 &&
+        timestamp_ms - s_last_sta_scan_defer_log_ms <
+            (int64_t)NETWORK_WORKER_STA_SCAN_DEFER_LOG_MS) {
+        return false;
+    }
+    s_last_sta_scan_defer_log_ms = timestamp_ms;
+    return true;
+}
+
+static bool sta_scan_start_is_admitted(void)
+{
+    const uint32_t active_requests = local_http_server_get_active_request_count();
+    if (active_requests != 0U) {
+        if (sta_scan_defer_log_due()) {
+            ESP_LOGI(TAG,
+                     "STA_SCAN_DEFER reason=local_http_active active=%lu",
+                     (unsigned long)active_requests);
+        }
+        return false;
+    }
+    if (voice_proxy_is_busy()) {
+        if (sta_scan_defer_log_due()) {
+            ESP_LOGI(TAG, "STA_SCAN_DEFER reason=voice_busy");
+        }
+        return false;
+    }
+    return true;
+}
+
+static void preempt_sta_scan_for_local_http(void)
+{
+    if (!s_sta_scan_in_progress) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "STA_SCAN_PREEMPT reason=local_http_active");
+    esp_err_t ret = gateway_wifi_cancel_sta_scan();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "STA_SCAN_PREEMPT reason=local_http_active cancel_failed ret=%s",
+                 esp_err_to_name(ret));
+        return;
+    }
+
+    s_sta_scan_in_progress = false;
+    schedule_sta_scan(false,
+                      NETWORK_WORKER_STA_LONG_DISCONNECTED_SCAN_MS,
+                      "no_known_ap");
+    ESP_LOGI(TAG,
+             "STA_SCAN_RESCHEDULE delay_ms=%u",
+             (unsigned int)NETWORK_WORKER_STA_LONG_DISCONNECTED_SCAN_MS);
+}
+
 static void schedule_sta_reconnect_from_disconnect(uint8_t disconnect_reason)
 {
     const network_reconnect_policy_t policy = classify_reconnect_policy(disconnect_reason);
@@ -1779,6 +1849,10 @@ static void service_sta_scan(void)
     }
     if (!s_sta_scan_pending || gateway_wifi_is_sta_connected() ||
         now_ms() < s_next_sta_scan_ms) {
+        return;
+    }
+    if (!sta_scan_start_is_admitted()) {
+        s_next_sta_scan_ms = now_ms() + (int64_t)NETWORK_WORKER_STA_SCAN_DEFER_RETRY_MS;
         return;
     }
 
@@ -2125,6 +2199,9 @@ static void handle_network_event(const network_worker_item_t *item)
     }
     case NETWORK_WORKER_SOURCE_LOCAL_HTTP_ENABLE:
         s_local_http_start_requested = true;
+        break;
+    case NETWORK_WORKER_SOURCE_LOCAL_HTTP_ACTIVE:
+        preempt_sta_scan_for_local_http();
         break;
     case NETWORK_WORKER_SOURCE_AP_STA_DISCONNECTED:
     {

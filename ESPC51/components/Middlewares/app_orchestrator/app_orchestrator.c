@@ -24,10 +24,9 @@
 #include "bme_sensor_service.h"
 #include "c5_backpressure_controller.h"
 #include "c5_memory.h"
-#include "gateway_link.h"
-#if MAIN_ENABLE_CSI_SERVICE
 #include "csi_service.h"
-#endif
+#include "gateway_link.h"
+#include "lcd_service.h"
 #include "speaker_player.h"
 #include "system_service.h"
 #include "voice_chain.h"
@@ -35,6 +34,85 @@
 
 /* 日志标签：只在本文件使用，不作为调试参数。 */
 static const char *TAG = "APP_MAIN";
+
+static lcd_dashboard_air_state_t app_lcd_air_state(bme_sensor_air_state_t state)
+{
+    switch (state) {
+    case BME_SENSOR_AIR_STATE_READY:
+        return LCD_DASHBOARD_AIR_READY;
+    case BME_SENSOR_AIR_STATE_DEGRADED:
+        return LCD_DASHBOARD_AIR_DEGRADED;
+    case BME_SENSOR_AIR_STATE_CALIBRATING:
+        return LCD_DASHBOARD_AIR_CALIBRATING;
+    case BME_SENSOR_AIR_STATE_INIT:
+    default:
+        return LCD_DASHBOARD_AIR_INIT;
+    }
+}
+
+static lcd_dashboard_motion_state_t app_lcd_motion_state(csi_service_motion_state_t state)
+{
+    switch (state) {
+    case CSI_SERVICE_MOTION_IDLE:
+        return LCD_DASHBOARD_MOTION_IDLE;
+    case CSI_SERVICE_MOTION_MOTION:
+        return LCD_DASHBOARD_MOTION_MOTION;
+    case CSI_SERVICE_MOTION_INIT:
+    default:
+        return LCD_DASHBOARD_MOTION_INIT;
+    }
+}
+
+static lcd_dashboard_voice_state_t app_lcd_voice_state(voice_chain_state_t state)
+{
+    switch (state) {
+    case VOICE_WAKE_ACK:
+        return LCD_DASHBOARD_VOICE_WAKE;
+    case VOICE_RECORDING:
+        return LCD_DASHBOARD_VOICE_REC;
+    case VOICE_WAITING_RESPONSE:
+        return LCD_DASHBOARD_VOICE_WAIT;
+    case VOICE_PLAYING:
+        return LCD_DASHBOARD_VOICE_PLAY;
+    case VOICE_ERROR:
+        return LCD_DASHBOARD_VOICE_ERR;
+    case VOICE_IDLE:
+    case VOICE_LISTENING:
+    default:
+        return LCD_DASHBOARD_VOICE_LISTEN;
+    }
+}
+
+/* Called by the LVGL task. Each source call takes a short local snapshot only. */
+static bool app_lcd_dashboard_snapshot(lcd_dashboard_snapshot_t *out_snapshot, void *user_ctx)
+{
+    (void)user_ctx;
+    if (out_snapshot == NULL) {
+        return false;
+    }
+
+    bme_sensor_snapshot_t bme = {0};
+    csi_service_snapshot_t csi = {0};
+    bme_sensor_service_get_latest_snapshot(&bme);
+    csi_service_get_latest_snapshot(&csi);
+
+    *out_snapshot = (lcd_dashboard_snapshot_t){
+        .bme_valid = bme.valid,
+        .temperature_c = bme.temperature_c,
+        .humidity_percent = bme.humidity_percent,
+        .pressure_hpa = bme.pressure_hpa,
+        .gas_resistance_ohm = bme.gas_resistance_ohm,
+        .air_state = app_lcd_air_state(bme.air_state),
+        .csi_valid = csi.valid,
+        .motion_score = csi.motion_score,
+        .confidence = csi.confidence,
+        .motion_state = app_lcd_motion_state(csi.motion_state),
+        .network_ok = gateway_link_wifi_is_stable(),
+        .gateway_ok = gateway_link_is_ready(),
+        .voice_state = app_lcd_voice_state(voice_chain_get_state()),
+    };
+    return true;
+}
 
 void app_orchestrator_start(void)
 {
@@ -175,6 +253,12 @@ void app_orchestrator_start(void)
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_voice_chain_start");
 
+    lcd_service_set_snapshot_provider(app_lcd_dashboard_snapshot, NULL);
+    esp_err_t lcd_ret = lcd_service_start();
+    if (lcd_ret != ESP_OK) {
+        ESP_LOGW(TAG, "LCD/LVGL service start failed: %s", esp_err_to_name(lcd_ret));
+    }
+    app_stack_monitor_log(TAG, "app_startup_task", "after_lcd_service_start");
     // WiFi 重连、Mic ADC/VAD、本地 voice turn、speaker PCM 播放和 C5 runtime 都在后台任务中运行。
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(MAIN_IDLE_DELAY_MS));

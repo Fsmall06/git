@@ -59,6 +59,7 @@ static csi_feature_processor_t s_processor;
 static csi_edge_detector_t s_edge_detector;
 static csi_pending_sample_t s_pending_sample;
 static csi_latest_feature_slot_t s_latest_feature_slots[2];
+static csi_service_snapshot_t s_latest_display_snapshot;
 static uint32_t s_pending_sample_overwrites;
 static uint8_t s_latest_feature_read_index;
 static uint8_t s_latest_feature_write_index;
@@ -69,6 +70,7 @@ static void csi_service_clear_pending_locked(void)
 {
     memset(&s_pending_sample, 0, sizeof(s_pending_sample));
     memset(s_latest_feature_slots, 0, sizeof(s_latest_feature_slots));
+    memset(&s_latest_display_snapshot, 0, sizeof(s_latest_display_snapshot));
     s_pending_sample_valid = false;
     s_pending_sample_overwrites = 0U;
     s_latest_feature_read_index = 0U;
@@ -200,6 +202,12 @@ static void csi_service_process_frame(const csi_frame_sample_t *frame)
         s_latest_feature_slots[s_latest_feature_read_index].valid = false;
         s_latest_feature_read_index = slot;
         s_latest_feature_write_index = slot;
+        s_latest_display_snapshot.valid = true;
+        s_latest_display_snapshot.motion_score = feature.motion_score;
+        s_latest_display_snapshot.confidence = feature.confidence;
+        s_latest_display_snapshot.motion_state =
+            feature.state_hint == ENVELOPE_STATE_HINT_MOTION ? CSI_SERVICE_MOTION_MOTION :
+                                                               CSI_SERVICE_MOTION_IDLE;
         portEXIT_CRITICAL(&s_feature_lock);
     }
 }
@@ -326,6 +334,7 @@ esp_err_t csi_service_init(void)
     csi_feature_processor_init(&s_processor, &s_feature_config);
     csi_edge_detector_init(&s_edge_detector, NULL);
     memset(s_latest_feature_slots, 0, sizeof(s_latest_feature_slots));
+    memset(&s_latest_display_snapshot, 0, sizeof(s_latest_display_snapshot));
     s_latest_feature_read_index = 0;
     s_latest_feature_write_index = 0;
     s_pending_sample_valid = false;
@@ -377,6 +386,7 @@ esp_err_t csi_service_start(void)
     csi_feature_processor_init(&s_processor, &s_feature_config);
     csi_edge_detector_init(&s_edge_detector, NULL);
     memset(s_latest_feature_slots, 0, sizeof(s_latest_feature_slots));
+    memset(&s_latest_display_snapshot, 0, sizeof(s_latest_display_snapshot));
     s_latest_feature_read_index = 0;
     s_latest_feature_write_index = 0;
     s_pending_sample_valid = false;
@@ -439,5 +449,16 @@ void csi_service_resume(void)
     if (s_csi_started) {
         s_csi_paused = false;
     }
+    portEXIT_CRITICAL(&s_feature_lock);
+}
+
+void csi_service_get_latest_snapshot(csi_service_snapshot_t *out_snapshot)
+{
+    if (out_snapshot == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_feature_lock);
+    *out_snapshot = s_latest_display_snapshot;
     portEXIT_CRITICAL(&s_feature_lock);
 }

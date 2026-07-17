@@ -15,11 +15,6 @@
  * 只有 WakeNet 命中后才打开本地提示音和录音窗口，再进入现有 server voice chain。
  */
 
-/* 本地唤醒确认音配置：只影响提示音和提示音后录音窗口延迟。 */
-#ifndef LOCAL_WAKE_RECORD_DELAY_AFTER_ACK_MS
-#define LOCAL_WAKE_RECORD_DELAY_AFTER_ACK_MS 350U // 提示音播放后等待录音的延迟，单位 ms。
-#endif
-
 #ifndef LOCAL_WAKE_ACK_SAMPLE_RATE_HZ
 #define LOCAL_WAKE_ACK_SAMPLE_RATE_HZ 16000U // 提示音 PCM 采样率。
 #endif

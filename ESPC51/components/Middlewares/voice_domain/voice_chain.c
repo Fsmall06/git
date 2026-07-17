@@ -11,6 +11,7 @@
 #include "voice_chain.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "app_debug_config.h"
@@ -23,6 +24,7 @@
 #include "freertos/portmacro.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "gateway_link.h"
 #include "local_wake_word.h"
 #include "mic_adc_test.h"
@@ -36,6 +38,9 @@ static UBaseType_t s_voice_chain_stack_high_water_bytes;
 #define VOICE_CHAIN_RELEASE_RETRY_DELAY_MS 250U
 #endif
 
+#define VOICE_NO_SPEECH_TIMEOUT_MS 6000U
+#define VOICE_MAX_RECORDING_TIMEOUT_MS 15000U
+
 typedef enum {
     VOICE_CHAIN_EVENT_LOCAL_WAKE = 0,
     VOICE_CHAIN_EVENT_RECORDING_FINISHED,
@@ -43,6 +48,8 @@ typedef enum {
     VOICE_CHAIN_EVENT_SERVER_ERROR,
     VOICE_CHAIN_EVENT_GATEWAY_LINK_ABORT,
     VOICE_CHAIN_EVENT_RELEASE_RETRY,
+    VOICE_CHAIN_EVENT_NO_SPEECH_TIMEOUT,
+    VOICE_CHAIN_EVENT_MAX_RECORDING_TIMEOUT,
 } voice_chain_event_type_t;
 
 typedef struct {
@@ -61,9 +68,20 @@ typedef struct {
     uint32_t mic_generation;
     uint32_t release_retry_count;
     c5_voice_lease_t lease;
+    TimerHandle_t no_speech_timer;
+    TimerHandle_t max_recording_timer;
+    bool no_speech_timer_armed;
+    bool max_recording_timer_armed;
+    uint32_t no_speech_timer_generation;
+    uint32_t max_recording_timer_generation;
+    TickType_t recording_window_open_tick;
+    TickType_t speech_start_tick;
 } voice_chain_context_t;
 
 static voice_chain_context_t s_voice;
+static StaticTimer_t s_no_speech_timer_buffer;
+static StaticTimer_t s_max_recording_timer_buffer;
+static portMUX_TYPE s_voice_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_terminal_event_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_terminal_event_pending;
 static voice_chain_item_t s_terminal_event;
@@ -75,6 +93,7 @@ static esp_err_t voice_chain_queue_event(const voice_chain_item_t *item, const c
 static esp_err_t voice_chain_queue_terminal_event(const voice_chain_item_t *item,
                                                    const char *label);
 static void voice_chain_gateway_link_abort_cb(const char *reason);
+static void voice_chain_cancel_recording_timers(void);
 
 const char *voice_chain_state_name(voice_chain_state_t state)
 {
@@ -100,7 +119,11 @@ const char *voice_chain_state_name(voice_chain_state_t state)
 
 voice_chain_state_t voice_chain_get_state(void)
 {
-    return s_voice.state;
+    voice_chain_state_t state;
+    portENTER_CRITICAL(&s_voice_state_lock);
+    state = s_voice.state;
+    portEXIT_CRITICAL(&s_voice_state_lock);
+    return state;
 }
 
 static UBaseType_t voice_chain_current_stack_high_water(void)
@@ -182,14 +205,88 @@ static void voice_chain_log_start_failure(const char *stage, esp_err_t ret)
 
 static void voice_chain_set_state(voice_chain_state_t state)
 {
-    if (s_voice.state != state) {
-        ESP_LOGI(TAG,
-                 "state %s -> %s",
-                 voice_chain_state_name(s_voice.state),
-                 voice_chain_state_name(state));
-    }
+    voice_chain_state_t old_state;
+    portENTER_CRITICAL(&s_voice_state_lock);
+    old_state = s_voice.state;
     s_voice.state = state;
+    portEXIT_CRITICAL(&s_voice_state_lock);
+    if (old_state != state) {
+        ESP_LOGI(TAG,
+                  "state %s -> %s",
+                  voice_chain_state_name(old_state),
+                  voice_chain_state_name(state));
+    }
     voice_chain_log_heap("voice state", state);
+}
+
+static void voice_chain_recording_timeout_callback(TimerHandle_t timer)
+{
+    const voice_chain_event_type_t type =
+        (voice_chain_event_type_t)(uintptr_t)pvTimerGetTimerID(timer);
+    voice_chain_item_t item = { .type = type };
+    bool armed = false;
+
+    portENTER_CRITICAL(&s_voice_state_lock);
+    if (type == VOICE_CHAIN_EVENT_NO_SPEECH_TIMEOUT) {
+        armed = s_voice.no_speech_timer_armed;
+        item.lease_generation = s_voice.no_speech_timer_generation;
+    } else if (type == VOICE_CHAIN_EVENT_MAX_RECORDING_TIMEOUT) {
+        armed = s_voice.max_recording_timer_armed;
+        item.lease_generation = s_voice.max_recording_timer_generation;
+    }
+    portEXIT_CRITICAL(&s_voice_state_lock);
+
+    if (armed && item.lease_generation != 0U) {
+        (void)voice_chain_queue_terminal_event(&item, "recording_timeout");
+    }
+}
+
+static void voice_chain_arm_recording_timer(TimerHandle_t timer,
+                                            bool no_speech,
+                                            uint32_t lease_generation,
+                                            uint32_t timeout_ms)
+{
+    if (timer == NULL || lease_generation == 0U) {
+        return;
+    }
+    const TickType_t now = xTaskGetTickCount();
+    portENTER_CRITICAL(&s_voice_state_lock);
+    if (no_speech) {
+        s_voice.no_speech_timer_armed = true;
+        s_voice.no_speech_timer_generation = lease_generation;
+        s_voice.recording_window_open_tick = now;
+    } else {
+        s_voice.max_recording_timer_armed = true;
+        s_voice.max_recording_timer_generation = lease_generation;
+        s_voice.speech_start_tick = now;
+    }
+    portEXIT_CRITICAL(&s_voice_state_lock);
+    (void)xTimerStop(timer, 0);
+    (void)xTimerChangePeriod(timer, pdMS_TO_TICKS(timeout_ms), 0);
+    ESP_LOGI(TAG,
+             "%s timestamp_ms=%lu deadline_ms=%u generation=%lu",
+             no_speech ? "VOICE_RECORDING_WINDOW_OPEN" : "VOICE_SPEECH_START",
+             (unsigned long)(now * portTICK_PERIOD_MS),
+             (unsigned int)timeout_ms,
+             (unsigned long)lease_generation);
+}
+
+static void voice_chain_cancel_recording_timers(void)
+{
+    portENTER_CRITICAL(&s_voice_state_lock);
+    s_voice.no_speech_timer_armed = false;
+    s_voice.max_recording_timer_armed = false;
+    s_voice.no_speech_timer_generation = 0U;
+    s_voice.max_recording_timer_generation = 0U;
+    s_voice.recording_window_open_tick = 0;
+    s_voice.speech_start_tick = 0;
+    portEXIT_CRITICAL(&s_voice_state_lock);
+    if (s_voice.no_speech_timer != NULL) {
+        (void)xTimerStop(s_voice.no_speech_timer, 0);
+    }
+    if (s_voice.max_recording_timer != NULL) {
+        (void)xTimerStop(s_voice.max_recording_timer, 0);
+    }
 }
 
 static esp_err_t voice_chain_queue_event(const voice_chain_item_t *item, const char *label)
@@ -508,9 +605,13 @@ static esp_err_t voice_chain_finish_or_recover_to_listening(const char *reason, 
 
 static void voice_chain_abort_round(const char *reason)
 {
-    ESP_LOGW(TAG, "voice round abort reason=%s", reason != NULL ? reason : "<none>");
+    voice_chain_cancel_recording_timers();
+    local_wake_word_cancel_recording_window();
+    (void)server_voice_client_cancel_turn();
+    ESP_LOGW(TAG, "VOICE_ROUND_ABORT reason=%s", reason != NULL ? reason : "<none>");
     voice_chain_set_state(VOICE_ERROR);
     (void)voice_chain_finish_or_recover_to_listening(reason, true);
+    ESP_LOGI(TAG, "VOICE_RELEASE_COMPLETE reason=%s", reason != NULL ? reason : "<none>");
 }
 
 static esp_err_t voice_chain_prepare_for_server_voice_start(void *user_ctx)
@@ -596,6 +697,10 @@ static esp_err_t voice_chain_prepare_for_server_voice_start(void *user_ctx)
     }
 
     voice_chain_set_state(VOICE_RECORDING);
+    voice_chain_arm_recording_timer(s_voice.max_recording_timer,
+                                    false,
+                                    s_voice.lease.generation,
+                                    VOICE_MAX_RECORDING_TIMEOUT_MS);
     ESP_LOGI(TAG, "server voice recording window accepted");
     return ESP_OK;
 }
@@ -628,6 +733,7 @@ static esp_err_t voice_chain_server_voice_finish(void *user_ctx)
     if (!c5_resource_manager_lease_is_current(s_voice.lease.generation)) {
         return ESP_ERR_INVALID_STATE;
     }
+    voice_chain_cancel_recording_timers();
     voice_chain_set_state(VOICE_WAITING_RESPONSE);
     (void)c5_resource_manager_note_phase(s_voice.lease, "waiting_response");
     esp_err_t ret = mic_adc_test_pause();
@@ -787,6 +893,10 @@ static void voice_chain_handle_local_wake(void)
         return;
     }
     voice_chain_set_state(VOICE_RECORDING);
+    voice_chain_arm_recording_timer(s_voice.no_speech_timer,
+                                    true,
+                                    s_voice.lease.generation,
+                                    VOICE_NO_SPEECH_TIMEOUT_MS);
 }
 
 static void voice_chain_handle_recording_finished(void)
@@ -797,6 +907,8 @@ static void voice_chain_handle_recording_finished(void)
                  voice_chain_state_name(s_voice.state));
         return;
     }
+
+    voice_chain_cancel_recording_timers();
 
     esp_err_t ret = voice_chain_quiesce_mic_for_speaker("waiting_response");
     if (ret != ESP_OK) {
@@ -817,6 +929,7 @@ static void voice_chain_handle_recording_finished(void)
 
 static void voice_chain_handle_server_done(void)
 {
+    voice_chain_cancel_recording_timers();
     ESP_LOGI(TAG, "server voice turn done");
     ESP_LOGI(TAG, "SERVER_PCM_PLAYBACK_DONE");
     (void)local_wake_word_on_recording_finished();
@@ -860,12 +973,75 @@ static void voice_chain_handle_release_retry(const voice_chain_item_t *item)
     (void)voice_chain_finish_or_recover_to_listening(reason, true);
 }
 
+static bool voice_chain_consume_recording_timeout(voice_chain_event_type_t type,
+                                                   uint32_t generation,
+                                                   TickType_t *start_tick)
+{
+    bool valid = false;
+    portENTER_CRITICAL(&s_voice_state_lock);
+    if (type == VOICE_CHAIN_EVENT_NO_SPEECH_TIMEOUT) {
+        valid = s_voice.no_speech_timer_armed &&
+                s_voice.no_speech_timer_generation == generation;
+        if (valid) {
+            s_voice.no_speech_timer_armed = false;
+            if (start_tick != NULL) {
+                *start_tick = s_voice.recording_window_open_tick;
+            }
+        }
+    } else {
+        valid = s_voice.max_recording_timer_armed &&
+                s_voice.max_recording_timer_generation == generation;
+        if (valid) {
+            s_voice.max_recording_timer_armed = false;
+            if (start_tick != NULL) {
+                *start_tick = s_voice.speech_start_tick;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&s_voice_state_lock);
+    return valid;
+}
+
+static void voice_chain_handle_no_speech_timeout(const voice_chain_item_t *item)
+{
+    TickType_t start_tick = 0;
+    if (item == NULL || !voice_chain_consume_recording_timeout(item->type,
+                                                                 item->lease_generation,
+                                                                 &start_tick)) {
+        return;
+    }
+    uint32_t elapsed_ms = start_tick != 0 ?
+        (uint32_t)((xTaskGetTickCount() - start_tick) * portTICK_PERIOD_MS) : 0U;
+    ESP_LOGW(TAG, "VOICE_NO_SPEECH_TIMEOUT elapsed_ms=%lu generation=%lu",
+             (unsigned long)elapsed_ms, (unsigned long)item->lease_generation);
+    voice_chain_abort_round("no_speech_timeout");
+}
+
+static void voice_chain_handle_max_recording_timeout(const voice_chain_item_t *item)
+{
+    TickType_t start_tick = 0;
+    if (item == NULL || !voice_chain_consume_recording_timeout(item->type,
+                                                                 item->lease_generation,
+                                                                 &start_tick)) {
+        return;
+    }
+    uint32_t elapsed_ms = start_tick != 0 ?
+        (uint32_t)((xTaskGetTickCount() - start_tick) * portTICK_PERIOD_MS) : 0U;
+    ESP_LOGW(TAG, "VOICE_MAX_RECORDING_TIMEOUT elapsed_ms=%lu generation=%lu",
+             (unsigned long)elapsed_ms, (unsigned long)item->lease_generation);
+    if (mic_adc_test_request_voice_finish() != ESP_OK) {
+        voice_chain_abort_round("max_recording_finish_request_fail");
+    }
+}
+
 static bool voice_chain_event_requires_current_lease(voice_chain_event_type_t type)
 {
     return type == VOICE_CHAIN_EVENT_SERVER_DONE ||
            type == VOICE_CHAIN_EVENT_SERVER_ERROR ||
            type == VOICE_CHAIN_EVENT_GATEWAY_LINK_ABORT ||
-           type == VOICE_CHAIN_EVENT_RELEASE_RETRY;
+            type == VOICE_CHAIN_EVENT_RELEASE_RETRY ||
+            type == VOICE_CHAIN_EVENT_NO_SPEECH_TIMEOUT ||
+            type == VOICE_CHAIN_EVENT_MAX_RECORDING_TIMEOUT;
 }
 
 static void voice_chain_task(void *arg)
@@ -923,6 +1099,12 @@ static void voice_chain_task(void *arg)
         case VOICE_CHAIN_EVENT_RELEASE_RETRY:
             voice_chain_handle_release_retry(&item);
             app_stack_monitor_log(TAG, "voice_chain", "after_release_retry");
+            break;
+        case VOICE_CHAIN_EVENT_NO_SPEECH_TIMEOUT:
+            voice_chain_handle_no_speech_timeout(&item);
+            break;
+        case VOICE_CHAIN_EVENT_MAX_RECORDING_TIMEOUT:
+            voice_chain_handle_max_recording_timeout(&item);
             break;
         default:
             ESP_LOGW(TAG, "ignore unknown voice event type=%d", (int)item.type);
@@ -990,6 +1172,24 @@ esp_err_t voice_chain_start(void)
         return ret;
     }
     voice_chain_log_start_stage("voice_event_queue_create", "after", ESP_OK);
+
+    s_voice.no_speech_timer = xTimerCreateStatic("voice_no_speech",
+                                                  pdMS_TO_TICKS(VOICE_NO_SPEECH_TIMEOUT_MS),
+                                                  pdFALSE,
+                                                  (void *)(uintptr_t)VOICE_CHAIN_EVENT_NO_SPEECH_TIMEOUT,
+                                                  voice_chain_recording_timeout_callback,
+                                                  &s_no_speech_timer_buffer);
+    s_voice.max_recording_timer = xTimerCreateStatic("voice_max_record",
+                                                      pdMS_TO_TICKS(VOICE_MAX_RECORDING_TIMEOUT_MS),
+                                                      pdFALSE,
+                                                      (void *)(uintptr_t)VOICE_CHAIN_EVENT_MAX_RECORDING_TIMEOUT,
+                                                      voice_chain_recording_timeout_callback,
+                                                      &s_max_recording_timer_buffer);
+    if (s_voice.no_speech_timer == NULL || s_voice.max_recording_timer == NULL) {
+        ESP_LOGE(TAG, "voice recording timeout timer create failed");
+        voice_chain_cleanup_start_failure();
+        return ESP_ERR_NO_MEM;
+    }
 
     const mic_adc_voice_stream_ops_t server_voice_ops = {
         .prepare_cb = voice_chain_prepare_for_server_voice_start,

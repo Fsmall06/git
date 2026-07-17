@@ -28,7 +28,8 @@
 #define MIC_ADC_REPORT_SAMPLES        (MIC_ADC_SAMPLE_FREQ_HZ / 5) // 约 200 ms 一帧 VAD。
 #define MIC_ADC_READ_TIMEOUT_MS       1000 // ADC 读取超时。
 #define MIC_ADC_ERROR_RETRY_DELAY_MS  100  // 异常后短暂退避。
-#define MIC_ADC_TEST_TASK_STACK_SIZE  12288 // mic_adc_test 任务栈；ESP-IDF FreeRTOS 单位为字节。
+#define MIC_ADC_TEST_TASK_STACK_SIZE  4096 // 实测峰值 <=1884 B，保留 >=2212 B 余量；ESP-IDF FreeRTOS 单位为字节。
+#define MIC_ADC_MIN_DMA_LARGEST_BYTES MIC_ADC_STORE_BYTES // 创建 ADC continuous 前所需的最小连续 DMA 块。
 #define MIC_ADC_TASK_PRIORITY         4    // ADC 任务优先级。
 #define MIC_ADC_ENABLE_LOOP_DEBUG_LOG APP_DEBUG_MIC_ADC_LOOP_LOG   // 循环普通日志总开关，错误日志不受影响。
 #define MIC_ADC_ENABLE_STACK_DEBUG_LOG APP_DEBUG_MIC_ADC_STACK_LOG  // 任务栈水位诊断开关，server voice 稳定后默认关闭。
@@ -129,6 +130,14 @@ esp_err_t mic_adc_test_pause(void);
 esp_err_t mic_adc_test_resume(void);
 
 /**
+ * @brief Request that the Mic task finish the active server-voice stream.
+ *
+ * The request is consumed at an ADC task loop boundary, so no other task touches
+ * the stream state or ADC driver directly.
+ */
+esp_err_t mic_adc_test_request_voice_finish(void);
+
+/**
  * @brief 等待 Mic 任务进入暂停态。
  *
  * @param timeout_ms 最大等待时间，0 表示只检查一次。
@@ -150,11 +159,12 @@ esp_err_t mic_adc_test_wait_paused(uint32_t timeout_ms);
 esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms);
 
 /**
- * @brief 在同一 voice lease 内安全退出 Mic task 并释放 ADC continuous/DMA。
+ * @brief 在同一 voice lease 内保留 Mic task，仅释放 ADC continuous/DMA。
  *
  * 调用方法：voice_chain 在 Speaker PDM TX 初始化前调用。该函数不触碰
  * C5 resource lease/generation；仅在 Mic task 已离开 ADC read 临界区后释放
- * ADC handle 和其 DMA 资源。成功后必须通过 mic_adc_test_start() 重建 Mic。
+ * ADC handle 和其 DMA 资源。Mic task、事件组、WakeNet 与 PSRAM pre-roll 保持常驻；
+ * 成功后通过 mic_adc_test_start() 复用任务并重建 ADC。
  */
 esp_err_t mic_adc_test_release_for_speaker(uint32_t timeout_ms);
 

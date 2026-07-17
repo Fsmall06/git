@@ -330,8 +330,9 @@ esp_err_t local_wake_word_open_recording_window(void)
         return ESP_ERR_INVALID_STATE;
     }
     s_recording_window_open = true;
-    s_record_after_tick = xTaskGetTickCount() +
-                          pdMS_TO_TICKS(LOCAL_WAKE_RECORD_DELAY_AFTER_ACK_MS);
+    /* Mic ADC is stopped for the complete ACK playback and only restarted before this
+     * call. A further cooldown consumes an early VAD start edge without preserving it. */
+    s_record_after_tick = xTaskGetTickCount();
     portEXIT_CRITICAL(&s_wake_lock);
     ESP_LOGI(TAG, "RECORDING_WINDOW_OPEN");
     return ESP_OK;

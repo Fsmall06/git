@@ -28,6 +28,7 @@
 #include "freertos/semphr.h"
 #include "gateway_config.h"
 #include "gateway_wifi.h"
+#include "network_worker.h"
 #include "offline_policy.h"
 #include "protocol_adapter.h"
 #include "resource_manager.h"
@@ -47,7 +48,8 @@ static SemaphoreHandle_t s_server_lock;
 static portMUX_TYPE s_server_lock_mux = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_last_csi_rx_reject_log_ms;
 static portMUX_TYPE s_handler_metrics_lock = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t s_local_http_active_count;
+static uint32_t s_active_request_count;
+static int64_t s_last_request_activity_time_ms;
 static uint32_t s_telemetry_http_active;
 static int64_t s_last_sensor_ingress_success_log_ms;
 static int64_t s_last_sensor_ingress_failure_log_ms;
@@ -78,13 +80,66 @@ typedef struct {
     s3_scheduler_enqueue_diagnostics_t enqueue;
 } local_http_sensor_ingress_metrics_t;
 
+static bool local_http_request_begin(void)
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    bool notify_worker = false;
+    bool overflow = false;
+
+    portENTER_CRITICAL(&s_handler_metrics_lock);
+    if (s_active_request_count == UINT32_MAX) {
+        overflow = true;
+    } else {
+        notify_worker = s_active_request_count == 0U;
+        ++s_active_request_count;
+        s_last_request_activity_time_ms = now_ms;
+    }
+    portEXIT_CRITICAL(&s_handler_metrics_lock);
+
+    if (overflow) {
+        ESP_LOGE(TAG, "local HTTP active_request_count overflow");
+        return false;
+    }
+    if (notify_worker) {
+        esp_err_t ret = network_worker_post_event(NETWORK_WORKER_EVENT_LOCAL_HTTP_ACTIVE,
+                                                  NETWORK_WORKER_SOURCE_LOCAL_HTTP_ACTIVE,
+                                                  0U,
+                                                  0U);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "local HTTP active notification failed ret=%s",
+                     esp_err_to_name(ret));
+        }
+    }
+    return true;
+}
+
+static void local_http_request_finish(void)
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    bool underflow = false;
+
+    portENTER_CRITICAL(&s_handler_metrics_lock);
+    if (s_active_request_count == 0U) {
+        underflow = true;
+    } else {
+        --s_active_request_count;
+        s_last_request_activity_time_ms = now_ms;
+    }
+    portEXIT_CRITICAL(&s_handler_metrics_lock);
+
+    if (underflow) {
+        ESP_LOGE(TAG, "local HTTP active_request_count underflow");
+    }
+}
+
 static int64_t local_http_telemetry_begin(const char *route, bool emit_debug)
 {
     const int64_t started_us = esp_timer_get_time();
     uint32_t active;
     uint32_t telemetry;
     portENTER_CRITICAL(&s_handler_metrics_lock);
-    active = ++s_local_http_active_count;
+    active = s_active_request_count;
     telemetry = ++s_telemetry_http_active;
     portEXIT_CRITICAL(&s_handler_metrics_lock);
     if (emit_debug) {
@@ -105,13 +160,10 @@ static void local_http_telemetry_finish(const char *route,
     uint32_t active;
     uint32_t telemetry;
     portENTER_CRITICAL(&s_handler_metrics_lock);
-    if (s_local_http_active_count > 0U) {
-        --s_local_http_active_count;
-    }
     if (s_telemetry_http_active > 0U) {
         --s_telemetry_http_active;
     }
-    active = s_local_http_active_count;
+    active = s_active_request_count;
     telemetry = s_telemetry_http_active;
     portEXIT_CRITICAL(&s_handler_metrics_lock);
     if (emit_debug) {
@@ -1399,6 +1451,44 @@ static esp_err_t command_ack_handler(httpd_req_t *req)
     return send_local_ok(req, local_id, "200 OK");
 }
 
+typedef esp_err_t (*local_http_route_handler_t)(httpd_req_t *req);
+
+typedef struct {
+    local_http_route_handler_t handler;
+} local_http_route_context_t;
+
+static esp_err_t local_http_dispatch_handler(httpd_req_t *req)
+{
+    const local_http_route_context_t *route =
+        req != NULL ? (const local_http_route_context_t *)req->user_ctx : NULL;
+    if (route == NULL || route->handler == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const bool request_counted = local_http_request_begin();
+    const esp_err_t ret = route->handler(req);
+    if (request_counted) {
+        local_http_request_finish();
+    }
+    return ret;
+}
+
+static const local_http_route_context_t s_route_health = {.handler = health_handler};
+static const local_http_route_context_t s_route_health_update = {.handler = health_update_handler};
+static const local_http_route_context_t s_route_register = {.handler = register_handler};
+static const local_http_route_context_t s_route_heartbeat = {.handler = heartbeat_handler};
+static const local_http_route_context_t s_route_status_or_sensor = {.handler = status_or_sensor_handler};
+static const local_http_route_context_t s_route_csi_result = {.handler = csi_result_handler};
+static const local_http_route_context_t s_route_device_stream = {.handler = device_stream_handler};
+static const local_http_route_context_t s_route_voice_turn = {.handler = voice_proxy_handle_turn};
+static const local_http_route_context_t s_route_wake_prompt = {
+    .handler = wake_prompt_cache_gateway_handle_http,
+};
+static const local_http_route_context_t s_route_commands_pending = {
+    .handler = commands_pending_handler,
+};
+static const local_http_route_context_t s_route_command_ack = {.handler = command_ack_handler};
+
 local_http_server_state_t local_http_server_get_state(void)
 {
     SemaphoreHandle_t lock = server_lock_handle();
@@ -1437,6 +1527,24 @@ bool local_http_server_has_handle(void)
     const bool has_handle = s_server != NULL;
     xSemaphoreGive(lock);
     return has_handle;
+}
+
+uint32_t local_http_server_get_active_request_count(void)
+{
+    uint32_t active_count;
+    portENTER_CRITICAL(&s_handler_metrics_lock);
+    active_count = s_active_request_count;
+    portEXIT_CRITICAL(&s_handler_metrics_lock);
+    return active_count;
+}
+
+int64_t local_http_server_get_last_request_activity_time_ms(void)
+{
+    int64_t timestamp_ms;
+    portENTER_CRITICAL(&s_handler_metrics_lock);
+    timestamp_ms = s_last_request_activity_time_ms;
+    portEXIT_CRITICAL(&s_handler_metrics_lock);
+    return timestamp_ms;
 }
 
 esp_err_t local_http_server_start(void)
@@ -1502,18 +1610,18 @@ esp_err_t local_http_server_start_with_reason(const char *reason)
 
     const httpd_uri_t routes[] = {
         /* /local/v1 是 C5<->S3 边界；/api/... Server 路径不在本地 HTTP server 暴露。 */
-        {.uri = ESP111_PROTOCOL_ROUTE_HEALTH, .method = HTTP_GET, .handler = health_handler},
-        {.uri = ESP111_PROTOCOL_ROUTE_HEALTH, .method = HTTP_POST, .handler = health_update_handler},
-        {.uri = ESP111_PROTOCOL_ROUTE_REGISTER, .method = HTTP_POST, .handler = register_handler},
-        {.uri = ESP111_PROTOCOL_ROUTE_HEARTBEAT, .method = HTTP_POST, .handler = heartbeat_handler},
-        {.uri = ESP111_PROTOCOL_ROUTE_STATUS, .method = HTTP_POST, .handler = status_or_sensor_handler},
-        {.uri = ESP111_PROTOCOL_ROUTE_SENSOR, .method = HTTP_POST, .handler = status_or_sensor_handler},
-        {.uri = ESP111_PROTOCOL_ROUTE_CSI_RESULT, .method = HTTP_POST, .handler = csi_result_handler},
-        {.uri = ESP111_PROTOCOL_ROUTE_DEVICE_STREAM, .method = HTTP_POST, .handler = device_stream_handler},
-        {.uri = ESP111_PROTOCOL_ROUTE_VOICE_TURN, .method = HTTP_POST, .handler = voice_proxy_handle_turn},
-        {.uri = ESP111_PROTOCOL_ROUTE_WAKE_PROMPT_AUDIO, .method = HTTP_GET, .handler = wake_prompt_cache_gateway_handle_http},
-        {.uri = ESP111_PROTOCOL_ROUTE_COMMANDS_PENDING, .method = HTTP_GET, .handler = commands_pending_handler},
-        {.uri = ESP111_PROTOCOL_ROUTE_COMMAND_ACK_WILDCARD, .method = HTTP_POST, .handler = command_ack_handler},
+        {.uri = ESP111_PROTOCOL_ROUTE_HEALTH, .method = HTTP_GET, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_health},
+        {.uri = ESP111_PROTOCOL_ROUTE_HEALTH, .method = HTTP_POST, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_health_update},
+        {.uri = ESP111_PROTOCOL_ROUTE_REGISTER, .method = HTTP_POST, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_register},
+        {.uri = ESP111_PROTOCOL_ROUTE_HEARTBEAT, .method = HTTP_POST, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_heartbeat},
+        {.uri = ESP111_PROTOCOL_ROUTE_STATUS, .method = HTTP_POST, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_status_or_sensor},
+        {.uri = ESP111_PROTOCOL_ROUTE_SENSOR, .method = HTTP_POST, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_status_or_sensor},
+        {.uri = ESP111_PROTOCOL_ROUTE_CSI_RESULT, .method = HTTP_POST, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_csi_result},
+        {.uri = ESP111_PROTOCOL_ROUTE_DEVICE_STREAM, .method = HTTP_POST, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_device_stream},
+        {.uri = ESP111_PROTOCOL_ROUTE_VOICE_TURN, .method = HTTP_POST, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_voice_turn},
+        {.uri = ESP111_PROTOCOL_ROUTE_WAKE_PROMPT_AUDIO, .method = HTTP_GET, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_wake_prompt},
+        {.uri = ESP111_PROTOCOL_ROUTE_COMMANDS_PENDING, .method = HTTP_GET, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_commands_pending},
+        {.uri = ESP111_PROTOCOL_ROUTE_COMMAND_ACK_WILDCARD, .method = HTTP_POST, .handler = local_http_dispatch_handler, .user_ctx = (void *)&s_route_command_ack},
     };
 
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

@@ -99,7 +99,7 @@
 
 #ifndef APP_STARTUP_TASK_STACK
 /* 复杂 WiFi/HTTP/audio 启动链路任务栈，单位字节；避免压占 ESP-IDF main_task 栈。 */
-#define APP_STARTUP_TASK_STACK 12288U
+#define APP_STARTUP_TASK_STACK 10240U
 #endif
 
 #ifndef APP_STARTUP_TASK_PRIORITY

@@ -50,10 +50,36 @@ enum {
     MIC_CTRL_INIT_READY = BIT4,
     MIC_CTRL_INIT_ABORT = BIT5,
     MIC_ADC_CONTROL_RUNNING_BIT = BIT6,
+    /* The Mic task owns ADC/GDMA teardown while remaining paused for Speaker. */
+    MIC_ADC_CONTROL_RELEASE_RESOURCES_REQUEST_BIT = BIT7,
+    MIC_ADC_CONTROL_RESOURCES_RELEASED_BIT = BIT8,
+    /* A failed ADC create must wait for a new resource-recovery boundary. */
+    MIC_ADC_CONTROL_HANDLE_RETRY_SUPPRESSED_BIT = BIT9,
+    /* The voice state machine asks the Mic owner to finish a long recording. */
+    MIC_ADC_CONTROL_VOICE_FINISH_REQUEST_BIT = BIT10,
 };
 
+#define MIC_ADC_RESUME_DIAG_WINDOW_MS 2000U
+#define MIC_ADC_RESUME_DIAG_MAX_BLOCKS 5U
+
+typedef struct {
+    uint32_t generation;
+    TickType_t start_tick;
+    uint32_t reads;
+    uint32_t bytes;
+    uint32_t read_errors;
+    uint32_t sample_logs;
+    uint32_t report_logs;
+    uint32_t vad_feeds;
+} mic_adc_resume_diag_t;
+
+static mic_adc_resume_diag_t s_mic_adc_resume_diag;
+
 /* Server voice path keeps only small pre-roll/live PCM buffers, never a whole utterance. */
-static int16_t s_mic_voice_pre_roll_storage[MIC_ADC_VOICE_PRE_ROLL_SAMPLES];
+#define MIC_ADC_VOICE_PRE_ROLL_STORAGE_BYTES \
+    (MIC_ADC_VOICE_PRE_ROLL_SAMPLES * sizeof(int16_t))
+
+static int16_t *s_mic_voice_pre_roll_storage;
 static int16_t s_mic_voice_live_chunk_storage[MIC_ADC_VOICE_LIVE_CHUNK_SAMPLES];
 static uint8_t s_mic_adc_raw_buffer[MIC_ADC_READ_BYTES];
 static adc_continuous_data_t s_mic_adc_parsed_buffer[MIC_ADC_READ_BYTES / SOC_ADC_DIGI_RESULT_BYTES];
@@ -222,6 +248,9 @@ static void mic_adc_log_start_failure(const char *stage, esp_err_t ret)
 
 static bool mic_adc_pause_requested(void);
 static bool mic_adc_stop_requested(void);
+static bool mic_adc_release_resources_requested(void);
+static bool mic_adc_handle_retry_suppressed(void);
+static esp_err_t mic_adc_continuous_init(adc_continuous_handle_t *out_handle);
 #if ENABLE_VERBOSE_AUDIO_LOG
 static const char *mic_adc_voice_state_name(mic_adc_voice_state_t state);
 static bool mic_adc_voice_backend_is_ready(void);
@@ -337,8 +366,13 @@ static void mic_adc_voice_stream_init(mic_adc_voice_stream_t *stream,
         return;
     }
 
-    stream->pre_roll_samples = pre_roll_storage;
-    stream->pre_roll_capacity_samples = pre_roll_capacity_samples;
+    if (pre_roll_storage == NULL || pre_roll_capacity_samples == 0) {
+        stream->pre_roll_samples = NULL;
+        stream->pre_roll_capacity_samples = 0;
+    } else {
+        stream->pre_roll_samples = pre_roll_storage;
+        stream->pre_roll_capacity_samples = pre_roll_capacity_samples;
+    }
     stream->pre_roll_sample_count = 0;
     stream->pre_roll_write_index = 0;
     stream->live_chunk_samples = live_chunk_storage;
@@ -373,7 +407,19 @@ static void mic_adc_voice_stream_push_pre_roll(mic_adc_voice_stream_t *stream, i
     if (stream == NULL ||
         stream->pre_roll_samples == NULL ||
         stream->pre_roll_capacity_samples == 0) {
+        if (stream != NULL) {
+            stream->pre_roll_samples = NULL;
+            stream->pre_roll_capacity_samples = 0;
+            stream->pre_roll_sample_count = 0;
+            stream->pre_roll_write_index = 0;
+        }
         return;
+    }
+
+    if (stream->pre_roll_sample_count > stream->pre_roll_capacity_samples ||
+        stream->pre_roll_write_index >= stream->pre_roll_capacity_samples) {
+        stream->pre_roll_sample_count = 0;
+        stream->pre_roll_write_index = 0;
     }
 
     stream->pre_roll_samples[stream->pre_roll_write_index] = pcm_sample;
@@ -400,6 +446,10 @@ static void mic_adc_voice_stream_clear_pre_roll(mic_adc_voice_stream_t *stream)
         return;
     }
 
+    if (stream->pre_roll_samples == NULL || stream->pre_roll_capacity_samples == 0) {
+        stream->pre_roll_samples = NULL;
+        stream->pre_roll_capacity_samples = 0;
+    }
     stream->pre_roll_sample_count = 0;
     stream->pre_roll_write_index = 0;
 }
@@ -692,6 +742,13 @@ static void mic_adc_reset_runtime_state(mic_adc_window_t *window,
                                         mic_adc_local_wake_t *local_wake)
 {
     const uint32_t generation = mic_adc_next_generation();
+    if (s_mic_adc_control_events != NULL) {
+        xEventGroupClearBits(s_mic_adc_control_events,
+                             MIC_ADC_CONTROL_VOICE_FINISH_REQUEST_BIT);
+    }
+    memset(&s_mic_adc_resume_diag, 0, sizeof(s_mic_adc_resume_diag));
+    s_mic_adc_resume_diag.generation = generation;
+    s_mic_adc_resume_diag.start_tick = xTaskGetTickCount();
     if (pcm_converter != NULL) {
         mic_adc_pcm_converter_init(pcm_converter);
     }
@@ -714,6 +771,47 @@ static void mic_adc_reset_runtime_state(mic_adc_window_t *window,
              s_mic_adc_owner_task != NULL ? pcTaskGetName(s_mic_adc_owner_task) : "<none>");
 }
 
+static bool mic_adc_resume_diag_active(void)
+{
+    return s_mic_adc_resume_diag.generation != 0U &&
+           (int32_t)(xTaskGetTickCount() - s_mic_adc_resume_diag.start_tick) <=
+               (int32_t)pdMS_TO_TICKS(MIC_ADC_RESUME_DIAG_WINDOW_MS);
+}
+
+static void mic_adc_resume_diag_log_read(uint32_t bytes, bool read_error)
+{
+    if (!mic_adc_resume_diag_active()) {
+        return;
+    }
+    s_mic_adc_resume_diag.reads++;
+    s_mic_adc_resume_diag.bytes += bytes;
+    if (read_error) {
+        s_mic_adc_resume_diag.read_errors++;
+    }
+    if (s_mic_adc_resume_diag.sample_logs++ >= MIC_ADC_RESUME_DIAG_MAX_BLOCKS) {
+        return;
+    }
+    ESP_LOGI(TAG,
+             "MIC_RESUME_SAMPLE_DIAG generation=%lu reads=%lu bytes=%lu read_errors=%lu",
+             (unsigned long)s_mic_adc_resume_diag.generation,
+             (unsigned long)s_mic_adc_resume_diag.reads,
+             (unsigned long)s_mic_adc_resume_diag.bytes,
+             (unsigned long)s_mic_adc_resume_diag.read_errors);
+}
+
+static bool mic_adc_voice_finish_requested(void)
+{
+    if (s_mic_adc_control_events == NULL) {
+        return false;
+    }
+    EventBits_t bits = xEventGroupGetBits(s_mic_adc_control_events);
+    if ((bits & MIC_ADC_CONTROL_VOICE_FINISH_REQUEST_BIT) == 0) {
+        return false;
+    }
+    xEventGroupClearBits(s_mic_adc_control_events, MIC_ADC_CONTROL_VOICE_FINISH_REQUEST_BIT);
+    return true;
+}
+
 static bool mic_adc_pause_requested(void)
 {
     if (s_mic_adc_control_events == NULL) {
@@ -732,15 +830,219 @@ static bool mic_adc_stop_requested(void)
     return (bits & MIC_ADC_CONTROL_STOP_REQUEST_BIT) != 0;
 }
 
+static bool mic_adc_release_resources_requested(void)
+{
+    if (s_mic_adc_control_events == NULL) {
+        return false;
+    }
+    EventBits_t bits = xEventGroupGetBits(s_mic_adc_control_events);
+    return (bits & MIC_ADC_CONTROL_RELEASE_RESOURCES_REQUEST_BIT) != 0;
+}
+
+static bool mic_adc_handle_retry_suppressed(void)
+{
+    if (s_mic_adc_control_events == NULL) {
+        return false;
+    }
+    EventBits_t bits = xEventGroupGetBits(s_mic_adc_control_events);
+    return (bits & MIC_ADC_CONTROL_HANDLE_RETRY_SUPPRESSED_BIT) != 0;
+}
+
+static void mic_adc_suppress_handle_retry(const char *reason, esp_err_t ret)
+{
+    s_adc_handle = NULL;
+    if (s_mic_adc_control_events != NULL) {
+        xEventGroupSetBits(s_mic_adc_control_events,
+                           MIC_ADC_CONTROL_HANDLE_RETRY_SUPPRESSED_BIT);
+    }
+    ESP_LOGE(TAG,
+             "MIC_ADC_HANDLE_CREATE_FAILED retry_suppressed=1 generation=%lu reason=%s ret=%s",
+             (unsigned long)s_mic_session_generation,
+             reason != NULL ? reason : "unknown",
+             esp_err_to_name(ret));
+}
+
+static void mic_adc_clear_handle_retry_suppression(const char *reason)
+{
+    if (!mic_adc_handle_retry_suppressed()) {
+        return;
+    }
+    xEventGroupClearBits(s_mic_adc_control_events,
+                         MIC_ADC_CONTROL_HANDLE_RETRY_SUPPRESSED_BIT);
+    ESP_LOGI(TAG,
+             "MIC_ADC_HANDLE_CREATE_RETRY_ENABLED generation=%lu reason=%s",
+             (unsigned long)s_mic_session_generation,
+             reason != NULL ? reason : "unknown");
+}
+
+static void mic_adc_wait_for_handle_recovery(void)
+{
+    if (s_mic_adc_control_events == NULL) {
+        return;
+    }
+    (void)xEventGroupWaitBits(s_mic_adc_control_events,
+                              MIC_ADC_CONTROL_PAUSE_REQUEST_BIT |
+                                  MIC_ADC_CONTROL_STOP_REQUEST_BIT,
+                              pdFALSE,
+                              pdFALSE,
+                              portMAX_DELAY);
+}
+
+static void mic_adc_voice_stream_detach_pre_roll(mic_adc_voice_stream_t *stream)
+{
+    if (stream == NULL) {
+        return;
+    }
+
+    stream->pre_roll_samples = NULL;
+    stream->pre_roll_capacity_samples = 0;
+    stream->pre_roll_sample_count = 0;
+    stream->pre_roll_write_index = 0;
+}
+
+static esp_err_t mic_adc_allocate_voice_pre_roll_storage(void)
+{
+    if (s_mic_voice_pre_roll_storage != NULL) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG,
+             "Mic voice pre-roll PSRAM alloc bytes=%u",
+             (unsigned int)MIC_ADC_VOICE_PRE_ROLL_STORAGE_BYTES);
+    c5_mem_log("mic_voice_pre_roll_before_alloc");
+    s_mic_voice_pre_roll_storage = c5_mem_calloc(MIC_ADC_VOICE_PRE_ROLL_SAMPLES,
+                                                  sizeof(int16_t),
+                                                  C5_MEM_PSRAM,
+                                                  "mic_voice_pre_roll");
+    if (s_mic_voice_pre_roll_storage == NULL) {
+        ESP_LOGE(TAG,
+                 "Mic voice pre-roll PSRAM alloc failed bytes=%u",
+                 (unsigned int)MIC_ADC_VOICE_PRE_ROLL_STORAGE_BYTES);
+        c5_mem_log("mic_voice_pre_roll_alloc_failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG,
+             "Mic voice pre-roll PSRAM alloc ok bytes=%u",
+             (unsigned int)MIC_ADC_VOICE_PRE_ROLL_STORAGE_BYTES);
+    c5_mem_log("mic_voice_pre_roll_after_alloc");
+    return ESP_OK;
+}
+
+static void mic_adc_release_voice_pre_roll_storage(const char *reason)
+{
+    if (s_mic_voice_pre_roll_storage == NULL) {
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "Mic voice pre-roll PSRAM release reason=%s bytes=%u",
+             reason != NULL ? reason : "unspecified",
+             (unsigned int)MIC_ADC_VOICE_PRE_ROLL_STORAGE_BYTES);
+    c5_mem_log("mic_voice_pre_roll_before_free");
+    memset(s_mic_voice_pre_roll_storage, 0, MIC_ADC_VOICE_PRE_ROLL_STORAGE_BYTES);
+    c5_mem_free(s_mic_voice_pre_roll_storage, "mic_voice_pre_roll");
+    s_mic_voice_pre_roll_storage = NULL;
+    c5_mem_log("mic_voice_pre_roll_after_free");
+}
+
 static void mic_adc_clear_static_audio_storage(void)
 {
-    memset(s_mic_voice_pre_roll_storage, 0, sizeof(s_mic_voice_pre_roll_storage));
+    if (s_mic_voice_pre_roll_storage != NULL) {
+        memset(s_mic_voice_pre_roll_storage, 0, MIC_ADC_VOICE_PRE_ROLL_STORAGE_BYTES);
+    }
     memset(s_mic_voice_live_chunk_storage, 0, sizeof(s_mic_voice_live_chunk_storage));
     memset(s_mic_adc_raw_buffer, 0, sizeof(s_mic_adc_raw_buffer));
     memset(s_mic_adc_parsed_buffer, 0, sizeof(s_mic_adc_parsed_buffer));
 }
 
-static void mic_adc_handle_pause_if_needed(adc_continuous_handle_t handle,
+static esp_err_t mic_adc_ensure_handle(adc_continuous_handle_t *handle)
+{
+    if (!mic_adc_current_task_is_owner("create")) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (handle == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (mic_adc_handle_retry_suppressed()) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (*handle != NULL) {
+        ESP_LOGI(TAG, "MIC_ADC_HANDLE_REUSE generation=%lu",
+                 (unsigned long)s_mic_session_generation);
+        return ESP_OK;
+    }
+
+    mic_adc_log_start_stage("mic_adc_handle_create", "before", ESP_ERR_NOT_FINISHED);
+    esp_err_t ret = mic_adc_continuous_init(handle);
+    mic_adc_log_start_stage("mic_adc_handle_create", "after", ret);
+    if (ret != ESP_OK) {
+        *handle = NULL;
+        mic_adc_suppress_handle_retry("adc_continuous_new_handle", ret);
+        return ret;
+    }
+
+    s_adc_handle = *handle;
+    ESP_LOGI(TAG, "MIC_ADC_HANDLE_CREATED generation=%lu",
+             (unsigned long)s_mic_session_generation);
+    app_stack_monitor_log(TAG, "mic_adc_test", "adc_handle_created");
+    return ESP_OK;
+}
+
+static void mic_adc_release_resources_if_requested(adc_continuous_handle_t *handle,
+                                                   bool *adc_started)
+{
+    if (!mic_adc_current_task_is_owner("release")) {
+        return;
+    }
+    if (handle == NULL || adc_started == NULL || !mic_adc_release_resources_requested() ||
+        s_mic_adc_control_events == NULL) {
+        return;
+    }
+
+    EventBits_t bits = xEventGroupGetBits(s_mic_adc_control_events);
+    if ((bits & MIC_ADC_CONTROL_RESOURCES_RELEASED_BIT) != 0) {
+        return;
+    }
+
+    if (*adc_started && *handle != NULL) {
+        esp_err_t stop_ret = adc_continuous_stop(*handle);
+        if (stop_ret != ESP_OK && stop_ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "ADC continuous stop failed before resource release: %s",
+                     esp_err_to_name(stop_ret));
+            return;
+        }
+    }
+    *adc_started = false;
+    s_mic_adc_started = false;
+    xEventGroupClearBits(s_mic_adc_control_events, MIC_ADC_CONTROL_RUNNING_BIT);
+
+    if (*handle != NULL) {
+        if (s_adc_handle != *handle) {
+            ESP_LOGE(TAG, "MIC_ADC_HANDLE_OWNERSHIP_MISMATCH during release");
+            return;
+        }
+        mic_adc_log_start_stage("mic_adc_handle_release", "before", ESP_ERR_NOT_FINISHED);
+        esp_err_t deinit_ret = adc_continuous_deinit(*handle);
+        mic_adc_log_start_stage("mic_adc_handle_release", "after", deinit_ret);
+        if (deinit_ret != ESP_OK && deinit_ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "ADC continuous deinit failed before Speaker: %s",
+                     esp_err_to_name(deinit_ret));
+            return;
+        }
+        *handle = NULL;
+        s_adc_handle = NULL;
+    } else {
+        s_adc_handle = NULL;
+    }
+
+    xEventGroupSetBits(s_mic_adc_control_events, MIC_ADC_CONTROL_RESOURCES_RELEASED_BIT);
+    ESP_LOGI(TAG, "MIC_ADC_RESOURCES_RELEASED generation=%lu",
+             (unsigned long)s_mic_session_generation);
+    app_stack_monitor_log(TAG, "mic_adc_test", "adc_resources_released");
+}
+
+static void mic_adc_handle_pause_if_needed(adc_continuous_handle_t *handle,
                                            bool *adc_started,
                                            mic_adc_window_t *window,
                                            mic_adc_pcm_converter_t *pcm_converter,
@@ -751,7 +1053,7 @@ static void mic_adc_handle_pause_if_needed(adc_continuous_handle_t handle,
     if (!mic_adc_current_task_is_owner("pause")) {
         return;
     }
-    if (adc_started == NULL) {
+    if (handle == NULL || adc_started == NULL) {
         return;
     }
     if (!mic_adc_pause_requested()) {
@@ -766,9 +1068,9 @@ static void mic_adc_handle_pause_if_needed(adc_continuous_handle_t handle,
     mic_adc_log_heap("Mic ADC pause stage: before runtime reset");
     mic_adc_reset_runtime_state(window, pcm_converter, vad, voice_stream, local_wake);
     mic_adc_log_heap("Mic ADC pause stage: after runtime reset");
-    if (*adc_started) {
+    if (*adc_started && *handle != NULL) {
         mic_adc_log_heap("Mic ADC pause stage: before adc_continuous_stop");
-        esp_err_t stop_ret = adc_continuous_stop(handle);
+        esp_err_t stop_ret = adc_continuous_stop(*handle);
         mic_adc_log_heap("Mic ADC pause stage: after adc_continuous_stop");
         if (stop_ret == ESP_OK) {
             *adc_started = false;
@@ -795,6 +1097,7 @@ static void mic_adc_handle_pause_if_needed(adc_continuous_handle_t handle,
             ESP_LOGD(TAG, "Mic ADC pause loop interrupted by reconnect stop request");
             return;
         }
+        mic_adc_release_resources_if_requested(handle, adc_started);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 
@@ -805,25 +1108,7 @@ static void mic_adc_handle_pause_if_needed(adc_continuous_handle_t handle,
     if (s_mic_adc_control_events != NULL) {
         xEventGroupClearBits(s_mic_adc_control_events, MIC_ADC_CONTROL_PAUSED_BIT);
     }
-    if (*adc_started) {
-        ESP_LOGW(TAG, "ADC continuous resume skipped: adc_started=1");
-        return;
-    }
-    mic_adc_log_heap("Mic ADC resume stage: before adc_continuous_start");
-    esp_err_t ret = adc_continuous_start(handle);
-    mic_adc_log_heap("Mic ADC resume stage: after adc_continuous_start");
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ADC continuous resume failed: %s", esp_err_to_name(ret));
-        vTaskDelay(pdMS_TO_TICKS(MIC_ADC_ERROR_RETRY_DELAY_MS));
-        return;
-    }
-    *adc_started = true;
-    s_mic_adc_started = true;
-    xEventGroupSetBits(s_mic_adc_control_events, MIC_ADC_CONTROL_RUNNING_BIT);
-    mic_adc_log_heap("Mic ADC resume stage: before runtime reset");
-    mic_adc_reset_runtime_state(window, pcm_converter, vad, voice_stream, local_wake);
-    mic_adc_log_heap("Mic ADC resume stage: after runtime reset");
-    mic_adc_log_state("Mic ADC resumed for listening", *adc_started, voice_stream);
+    /* The main loop recreates an ADC/GDMA handle, if needed, before restarting it. */
 }
 
 static esp_err_t mic_adc_start_if_needed(adc_continuous_handle_t handle,
@@ -924,6 +1209,7 @@ static bool mic_adc_handle_stop_if_requested(adc_continuous_handle_t handle,
 
     EventGroupHandle_t events = s_mic_adc_control_events;
     s_mic_adc_task_handle = NULL;
+    s_mic_adc_owner_task = NULL;
     if (events != NULL) {
         xEventGroupClearBits(events, MIC_ADC_CONTROL_PAUSED_BIT);
         xEventGroupClearBits(events, MIC_ADC_CONTROL_RUNNING_BIT);
@@ -968,10 +1254,20 @@ static bool mic_adc_voice_stream_poll_finish(mic_adc_voice_stream_t *stream)
  */
 static esp_err_t mic_adc_voice_stream_send_pre_roll(mic_adc_voice_stream_t *stream)
 {
-    if (stream == NULL || stream->state != MIC_ADC_VOICE_STATE_STREAMING ||
-        stream->pre_roll_samples == NULL ||
-        stream->pre_roll_sample_count == 0) {
+    if (stream == NULL || stream->state != MIC_ADC_VOICE_STATE_STREAMING) {
         return ESP_OK;
+    }
+    if (stream->pre_roll_samples == NULL || stream->pre_roll_capacity_samples == 0) {
+        mic_adc_voice_stream_clear_pre_roll(stream);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (stream->pre_roll_sample_count == 0) {
+        return ESP_OK;
+    }
+    if (stream->pre_roll_sample_count > stream->pre_roll_capacity_samples ||
+        stream->pre_roll_write_index >= stream->pre_roll_capacity_samples) {
+        mic_adc_voice_stream_clear_pre_roll(stream);
+        return ESP_ERR_INVALID_STATE;
     }
     if (stream->live_chunk_capacity_samples == 0) {
         return ESP_ERR_INVALID_STATE;
@@ -1420,6 +1716,28 @@ static void mic_adc_window_report(const mic_adc_window_t *window,
         .clipped = clipped,
     };
     mic_vad_event_t vad_event = mic_vad_process(vad, &vad_features);
+    if (mic_adc_resume_diag_active() &&
+        s_mic_adc_resume_diag.report_logs++ < MIC_ADC_RESUME_DIAG_MAX_BLOCKS) {
+        const int32_t dc = (int32_t)(window->sum_pcm / (int64_t)window->count);
+        const bool window_open = local_wake_word_is_recording_window_open();
+        ESP_LOGI(TAG,
+                 "MIC_PCM_LEVEL generation=%lu peak=%u rms=%u dc=%ld",
+                 (unsigned long)s_mic_adc_resume_diag.generation,
+                 (unsigned int)pcm_peak,
+                 (unsigned int)pcm_rms,
+                 (long)dc);
+        ESP_LOGI(TAG,
+                 "VAD_FEED_DIAG generation=%lu feed_count=%lu speech=%d probability=n/a",
+                 (unsigned long)s_mic_adc_resume_diag.generation,
+                 (unsigned long)++s_mic_adc_resume_diag.vad_feeds,
+                 vad_event == MIC_VAD_EVENT_VOICE_START ? 1 : 0);
+        ESP_LOGI(TAG,
+                 "MIC_RECORD_GATE generation=%lu window=%d paused=%d stream_enabled=%d vad_enabled=1",
+                 (unsigned long)s_mic_adc_resume_diag.generation,
+                 window_open ? 1 : 0,
+                 mic_adc_pause_requested() ? 1 : 0,
+                 voice_stream->state == MIC_ADC_VOICE_STATE_STREAMING ? 1 : 0);
+    }
 
     if (vad_event == MIC_VAD_EVENT_VOICE_START) {
         if (voice_stream->state == MIC_ADC_VOICE_STATE_FINISHING) {
@@ -1494,6 +1812,26 @@ static void mic_adc_log_stack_high_water_mark(void)
  */
 static esp_err_t mic_adc_continuous_init(adc_continuous_handle_t *out_handle)
 {
+    if (out_handle == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_handle = NULL;
+
+    const size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    const size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    ESP_LOGI(TAG,
+             "MIC_ADC_CREATE_PRECHECK dma_free=%u dma_largest=%u required_largest=%u",
+             (unsigned int)dma_free,
+             (unsigned int)dma_largest,
+             (unsigned int)MIC_ADC_MIN_DMA_LARGEST_BYTES);
+    if (dma_largest < MIC_ADC_MIN_DMA_LARGEST_BYTES) {
+        ESP_LOGE(TAG,
+                 "MIC_ADC_CREATE_PRECHECK_FAIL dma_largest=%u required_largest=%u",
+                 (unsigned int)dma_largest,
+                 (unsigned int)MIC_ADC_MIN_DMA_LARGEST_BYTES);
+        return ESP_ERR_NO_MEM;
+    }
+
     adc_continuous_handle_t handle = NULL;
     adc_continuous_handle_cfg_t handle_cfg = {
         .max_store_buf_size = MIC_ADC_STORE_BYTES,
@@ -1600,7 +1938,7 @@ static void mic_adc_test_task(void *arg)
 #endif
 
     while (1) {
-        mic_adc_handle_pause_if_needed(handle,
+        mic_adc_handle_pause_if_needed(&handle,
                                        &adc_started,
                                        &window,
                                        &pcm_converter,
@@ -1617,7 +1955,28 @@ static void mic_adc_test_task(void *arg)
             continue;
         }
 
+        if (mic_adc_voice_finish_requested()) {
+            if (s_mic_adc_voice_stream.state == MIC_ADC_VOICE_STATE_STREAMING ||
+                s_mic_adc_voice_stream.state == MIC_ADC_VOICE_STATE_POST_ROLL) {
+                ESP_LOGI(TAG, "MIC_VOICE_FINISH_REQUEST generation=%lu",
+                         (unsigned long)s_mic_session_generation);
+                mic_adc_voice_stream_finish(&s_mic_adc_voice_stream);
+            }
+        }
+
         if (!adc_started) {
+            if (mic_adc_handle_retry_suppressed()) {
+                mic_adc_wait_for_handle_recovery();
+                continue;
+            }
+            esp_err_t handle_ret = mic_adc_ensure_handle(&handle);
+            if (handle_ret != ESP_OK) {
+                ESP_LOGE(TAG, "ADC continuous handle create/reuse failed: %s",
+                         esp_err_to_name(handle_ret));
+                /* Creation failures may leave IDF driver internals partially initialized. */
+                mic_adc_wait_for_handle_recovery();
+                continue;
+            }
             esp_err_t start_ret = mic_adc_start_if_needed(handle,
                                                           &adc_started,
                                                           &window,
@@ -1647,16 +2006,20 @@ static void mic_adc_test_task(void *arg)
                                             &read_bytes,
                                             MIC_ADC_READ_TIMEOUT_MS);
         if (ret == ESP_ERR_TIMEOUT) {
+            mic_adc_resume_diag_log_read(0, true);
 #if MIC_ADC_ENABLE_LOOP_DEBUG_LOG
             ESP_LOGW(TAG, "ADC read timeout");
 #endif
             continue;
         }
         if (ret != ESP_OK) {
+            mic_adc_resume_diag_log_read(0, true);
             ESP_LOGE(TAG, "ADC read failed: %s", esp_err_to_name(ret));
             vTaskDelay(pdMS_TO_TICKS(MIC_ADC_ERROR_RETRY_DELAY_MS));
             continue;
         }
+
+        mic_adc_resume_diag_log_read(read_bytes, false);
 
         if (mic_adc_handle_stop_if_requested(handle,
                                              &adc_started,
@@ -1736,6 +2099,8 @@ static void mic_adc_cleanup_failed_start(void)
     s_mic_adc_started = false;
     mic_adc_local_wake_deinit(&s_mic_adc_local_wake);
     memset(&s_mic_adc_vad, 0, sizeof(s_mic_adc_vad));
+    mic_adc_voice_stream_detach_pre_roll(&s_mic_adc_voice_stream);
+    mic_adc_release_voice_pre_roll_storage("startup_rollback");
     memset(&s_mic_adc_voice_stream, 0, sizeof(s_mic_adc_voice_stream));
 
     if (s_adc_handle != NULL) {
@@ -1766,8 +2131,11 @@ esp_err_t mic_adc_test_start(void)
 {
     mic_adc_log_heap("Mic ADC start API: enter");
     if (s_mic_adc_task_handle != NULL) {
-        mic_adc_log_heap("Mic ADC start API: reuse existing task");
-        return ESP_OK;
+        ESP_LOGI(TAG,
+                 "MIC_ADC_TASK_REUSE generation=%lu adc_handle=%s",
+                 (unsigned long)s_mic_session_generation,
+                 s_adc_handle != NULL ? "present" : "released");
+        return mic_adc_test_resume();
     }
 
     if (s_mic_adc_control_events == NULL) {
@@ -1785,9 +2153,12 @@ esp_err_t mic_adc_test_start(void)
                          MIC_ADC_CONTROL_PAUSE_REQUEST_BIT |
                              MIC_ADC_CONTROL_PAUSED_BIT |
                              MIC_ADC_CONTROL_STOP_REQUEST_BIT |
-                             MIC_ADC_CONTROL_STOPPED_BIT |
-                             MIC_ADC_CONTROL_RUNNING_BIT |
-                             MIC_CTRL_INIT_READY |
+                              MIC_ADC_CONTROL_STOPPED_BIT |
+                              MIC_ADC_CONTROL_RUNNING_BIT |
+                              MIC_ADC_CONTROL_RELEASE_RESOURCES_REQUEST_BIT |
+                              MIC_ADC_CONTROL_RESOURCES_RELEASED_BIT |
+                              MIC_ADC_CONTROL_HANDLE_RETRY_SUPPRESSED_BIT |
+                              MIC_CTRL_INIT_READY |
                              MIC_CTRL_INIT_ABORT);
     mic_adc_log_heap("Mic ADC start API: after control event clear");
 
@@ -1798,9 +2169,18 @@ esp_err_t mic_adc_test_start(void)
     }
     mic_adc_log_heap("Mic ADC start API: after wifi ready check");
 
+    esp_err_t ret = mic_adc_allocate_voice_pre_roll_storage();
+    if (ret != ESP_OK) {
+        mic_adc_log_start_failure("c5_mem_calloc(mic_voice_pre_roll)", ret);
+        mic_adc_cleanup_failed_start();
+        return ret;
+    }
+
     mic_adc_log_start_stage("mic_adc_task_create", "before", ESP_ERR_NOT_FINISHED);
     ESP_LOGI(TAG,
              "VOICE_START_STAGE stage=mic_adc_task_create requested_stack_bytes=%u",
+             (unsigned int)MIC_ADC_TEST_TASK_STACK_SIZE);
+    ESP_LOGI(TAG, "MIC_ADC_TASK_CONFIG stack_bytes=%u",
              (unsigned int)MIC_ADC_TEST_TASK_STACK_SIZE);
     BaseType_t task_created = xTaskCreate(mic_adc_test_task,
                                           "mic_adc_test",
@@ -1818,7 +2198,7 @@ esp_err_t mic_adc_test_start(void)
     mic_adc_log_start_stage("mic_adc_task_create", "after", ESP_OK);
 
     mic_adc_log_start_stage("mic_adc_init", "before", ESP_ERR_NOT_FINISHED);
-    esp_err_t ret = mic_adc_continuous_init(&s_adc_handle);
+    ret = mic_adc_continuous_init(&s_adc_handle);
     mic_adc_log_start_stage("mic_adc_init", "after", ret);
     if (ret != ESP_OK) {
         mic_adc_log_start_failure("mic_adc_continuous_init", ret);
@@ -1894,9 +2274,25 @@ esp_err_t mic_adc_test_resume(void)
         return ESP_OK;
     }
     mic_adc_log_heap("Mic ADC resume API: VAD-only standby");
-    mic_adc_log_heap("Mic ADC resume API: before clear pause bit");
-    xEventGroupClearBits(s_mic_adc_control_events, MIC_ADC_CONTROL_PAUSE_REQUEST_BIT);
-    mic_adc_log_heap("Mic ADC resume API: after clear pause bit");
+    EventBits_t bits = xEventGroupGetBits(s_mic_adc_control_events);
+    if ((bits & MIC_ADC_CONTROL_RESOURCES_RELEASED_BIT) != 0) {
+        mic_adc_clear_handle_retry_suppression("speaker_resources_released");
+    }
+    mic_adc_log_heap("Mic ADC resume API: before clear pause/release bits");
+    xEventGroupClearBits(s_mic_adc_control_events,
+                         MIC_ADC_CONTROL_PAUSE_REQUEST_BIT |
+                             MIC_ADC_CONTROL_RELEASE_RESOURCES_REQUEST_BIT |
+                             MIC_ADC_CONTROL_RESOURCES_RELEASED_BIT);
+    mic_adc_log_heap("Mic ADC resume API: after clear pause/release bits");
+    return ESP_OK;
+}
+
+esp_err_t mic_adc_test_request_voice_finish(void)
+{
+    if (s_mic_adc_control_events == NULL || s_mic_adc_task_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xEventGroupSetBits(s_mic_adc_control_events, MIC_ADC_CONTROL_VOICE_FINISH_REQUEST_BIT);
     return ESP_OK;
 }
 
@@ -1920,10 +2316,12 @@ esp_err_t mic_adc_test_wait_paused(uint32_t timeout_ms)
 esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
 {
     mic_adc_log_heap("Mic ADC stop/deinit API: enter");
-    if (s_mic_adc_control_events == NULL || s_mic_adc_task_handle == NULL) {
+    if (s_mic_adc_task_handle == NULL) {
         mic_adc_log_heap("Mic ADC stop/deinit API: no running task");
         mic_adc_local_wake_deinit(&s_mic_adc_local_wake);
         memset(&s_mic_adc_vad, 0, sizeof(s_mic_adc_vad));
+        mic_adc_voice_stream_detach_pre_roll(&s_mic_adc_voice_stream);
+        mic_adc_release_voice_pre_roll_storage("stop_no_task");
         memset(&s_mic_adc_voice_stream, 0, sizeof(s_mic_adc_voice_stream));
         if (s_adc_handle != NULL) {
             mic_adc_log_heap("Mic ADC stop/deinit API: before adc continuous deinit no task");
@@ -1949,6 +2347,11 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
         mic_adc_log_heap("Mic ADC stop/deinit API: done no task");
         return ESP_OK;
     }
+    if (s_mic_adc_control_events == NULL) {
+        ESP_LOGE(TAG,
+                 "Mic ADC stop/deinit inconsistent state: task exists but control event group is NULL");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     mic_adc_log_heap("Mic ADC stop/deinit API: before set stop request");
     xEventGroupClearBits(s_mic_adc_control_events, MIC_ADC_CONTROL_STOPPED_BIT);
@@ -1971,6 +2374,8 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
     /* 任务可能仍在 READY gate 等待，停止确认后统一回收预初始化的状态。 */
     mic_adc_local_wake_deinit(&s_mic_adc_local_wake);
     memset(&s_mic_adc_vad, 0, sizeof(s_mic_adc_vad));
+    mic_adc_voice_stream_detach_pre_roll(&s_mic_adc_voice_stream);
+    mic_adc_release_voice_pre_roll_storage("stop_complete");
     memset(&s_mic_adc_voice_stream, 0, sizeof(s_mic_adc_voice_stream));
 
     if (s_adc_handle != NULL) {
@@ -2000,7 +2405,33 @@ esp_err_t mic_adc_test_stop_and_deinit_for_reconnect(uint32_t timeout_ms)
 
 esp_err_t mic_adc_test_release_for_speaker(uint32_t timeout_ms)
 {
-    return mic_adc_test_stop_and_deinit_for_reconnect(timeout_ms);
+    if (s_mic_adc_control_events == NULL || s_mic_adc_task_handle == NULL) {
+        ESP_LOGE(TAG, "Mic ADC resource release requested without a persistent task");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!mic_adc_test_is_paused()) {
+        ESP_LOGE(TAG, "Mic ADC resource release requested before pause completed");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    mic_adc_log_start_stage("mic_adc_resource_release", "before", ESP_ERR_NOT_FINISHED);
+    xEventGroupClearBits(s_mic_adc_control_events, MIC_ADC_CONTROL_RESOURCES_RELEASED_BIT);
+    xEventGroupSetBits(s_mic_adc_control_events, MIC_ADC_CONTROL_RELEASE_RESOURCES_REQUEST_BIT);
+    EventBits_t bits = xEventGroupWaitBits(s_mic_adc_control_events,
+                                           MIC_ADC_CONTROL_RESOURCES_RELEASED_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           pdMS_TO_TICKS(timeout_ms));
+    esp_err_t ret = (bits & MIC_ADC_CONTROL_RESOURCES_RELEASED_BIT) != 0 ? ESP_OK : ESP_ERR_TIMEOUT;
+    mic_adc_log_start_stage("mic_adc_resource_release", "after", ret);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "MIC_ADC_RELEASE_FOR_SPEAKER_DONE generation=%lu",
+                 (unsigned long)s_mic_session_generation);
+    } else {
+        ESP_LOGE(TAG, "Mic ADC resource release timeout: timeout_ms=%u",
+                 (unsigned int)timeout_ms);
+    }
+    return ret;
 }
 
 esp_err_t mic_adc_test_wait_running(uint32_t timeout_ms)

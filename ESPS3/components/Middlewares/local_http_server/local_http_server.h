@@ -9,6 +9,7 @@
  */
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -32,6 +33,10 @@ local_http_server_state_t local_http_server_get_state(void);
 bool local_http_server_is_running(void);
 /** @brief 读取是否仍保留 httpd 句柄，供重试前清理残留状态。 */
 bool local_http_server_has_handle(void);
+/** @brief Thread-safe snapshot of requests currently executing in local HTTP route handlers. */
+uint32_t local_http_server_get_active_request_count(void);
+/** @brief Monotonic timestamp of the most recent local HTTP request start or finish. */
+int64_t local_http_server_get_last_request_activity_time_ms(void);
 
 /**
  * @brief 启动 S3 本地 HTTP server 并注册 /local/v1 路由。

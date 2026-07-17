@@ -11,11 +11,28 @@
  * IDLE/MOTION edge state，不上传 raw CSI。
  */
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef enum {
+    CSI_SERVICE_MOTION_INIT = 0,
+    CSI_SERVICE_MOTION_IDLE,
+    CSI_SERVICE_MOTION_MOTION,
+} csi_service_motion_state_t;
+
+/** Thread-safe copy of the latest processed CSI feature for local display consumers. */
+typedef struct {
+    bool valid;
+    float motion_score;
+    float confidence;
+    csi_service_motion_state_t motion_state;
+} csi_service_snapshot_t;
 
 /**
  * @brief 初始化 CSI 服务状态。
@@ -51,6 +68,9 @@ esp_err_t csi_service_pause_and_wait(uint32_t timeout_ms);
 
 /** @brief 恢复 CSI 摘要上报；只有服务已启动时才生效。 */
 void csi_service_resume(void);
+
+/** Copy the latest processed CSI feature without consuming upload work or touching Wi-Fi. */
+void csi_service_get_latest_snapshot(csi_service_snapshot_t *out_snapshot);
 
 #ifdef __cplusplus
 }

@@ -25,6 +25,7 @@
 #include "c5_backpressure_controller.h"
 #include "c5_memory.h"
 #include "gateway_link.h"
+#include "lcd_service.h"
 #if MAIN_ENABLE_CSI_SERVICE
 #include "csi_service.h"
 #endif
@@ -175,6 +176,11 @@ void app_orchestrator_start(void)
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_voice_chain_start");
 
+    esp_err_t lcd_ret = lcd_service_start();
+    if (lcd_ret != ESP_OK) {
+        ESP_LOGW(TAG, "LCD/LVGL service start failed: %s", esp_err_to_name(lcd_ret));
+    }
+    app_stack_monitor_log(TAG, "app_startup_task", "after_lcd_service_start");
     // WiFi 重连、Mic ADC/VAD、本地 voice turn、speaker PCM 播放和 C5 runtime 都在后台任务中运行。
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(MAIN_IDLE_DELAY_MS));

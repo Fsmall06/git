@@ -49,6 +49,23 @@ extern "C" {
  * @return ESP_OK 表示服务已注册或已在运行。
  * 失败处理：orchestrator 记录错误，语音和命令链路仍按各自配置继续。
  */
+typedef enum {
+    BME_SENSOR_AIR_STATE_INIT = 0,
+    BME_SENSOR_AIR_STATE_READY,
+    BME_SENSOR_AIR_STATE_DEGRADED,
+    BME_SENSOR_AIR_STATE_CALIBRATING,
+} bme_sensor_air_state_t;
+
+/** Latest completed measurement. Units are Celsius, percent RH, hPa, and Ohm. */
+typedef struct {
+    bool valid;
+    float temperature_c;
+    float humidity_percent;
+    float pressure_hpa;
+    uint32_t gas_resistance_ohm;
+    bme_sensor_air_state_t air_state;
+} bme_sensor_snapshot_t;
+
 esp_err_t bme_sensor_service_start(void);
 
 /**
@@ -107,6 +124,9 @@ bool bme_sensor_service_is_running(void);
 
 /** @brief 查询当前是否处于暂停态；voice/runtime 诊断调用，返回 true/false。 */
 bool bme_sensor_service_is_paused(void);
+
+/** Copy the latest completed BME690 sample without performing I2C or HTTP work. */
+void bme_sensor_service_get_latest_snapshot(bme_sensor_snapshot_t *out_snapshot);
 
 #ifdef __cplusplus
 }

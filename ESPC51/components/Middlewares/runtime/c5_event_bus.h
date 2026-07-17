@@ -23,6 +23,14 @@ extern "C" {
 #endif
 
 typedef enum {
+    C5_LIFECYCLE_STOPPED = 0,
+    C5_LIFECYCLE_STARTING,
+    C5_LIFECYCLE_RUNNING,
+    C5_LIFECYCLE_STOPPING,
+    C5_LIFECYCLE_FAULT,
+} c5_lifecycle_state_t;
+
+typedef enum {
     C5_EVENT_CSI_READY = 0,
     C5_EVENT_BME_SAMPLE,
     C5_EVENT_HEARTBEAT,
@@ -58,8 +66,19 @@ typedef struct {
     uint32_t max_worker_latency_ms;
 } c5_event_bus_stats_t;
 
-/** @brief 初始化事件队列；可重复调用，已有队列时直接返回 ESP_OK。 */
+/**
+ * @brief 初始化事件队列；可重复调用，已有队列时直接返回 ESP_OK。
+ *
+ * init/deinit must be called serially by one control thread. Concurrent
+ * init/deinit safety is not provided.
+ */
 esp_err_t c5_event_bus_init(void);
+
+/** @brief 释放事件队列并清空 handler、统计与事件序号。调用方必须先停止 dispatcher。 */
+esp_err_t c5_event_bus_deinit(void);
+
+/** @brief 获取事件总线生命周期状态；状态查询不授予资源访问权限。 */
+c5_lifecycle_state_t c5_event_bus_get_state(void);
 
 /** @brief 注册某类事件的 dispatcher handler；handler 内只做快速路由。 */
 esp_err_t c5_event_bus_register_handler(c5_event_type_t type,

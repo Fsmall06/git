@@ -117,6 +117,7 @@ set(requires
             app_time_sync
             server_comm
             esp111_protocol_common
+            lcd
             espressif__esp-sr)
 
 idf_component_register(SRCS ${srcs}

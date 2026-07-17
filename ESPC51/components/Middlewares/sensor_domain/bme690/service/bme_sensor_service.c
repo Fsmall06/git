@@ -33,6 +33,7 @@ typedef struct {
     bool busy;
     bool initialized;
     bool stop_requested;
+    bme_sensor_snapshot_t latest_snapshot;
 } bme_sensor_service_context_t;
 
 static bme_sensor_service_context_t s_bme_service;
@@ -76,6 +77,29 @@ static bool bme_sensor_service_snapshot(bool *paused,
     portEXIT_CRITICAL(&s_bme_service_lock);
 
     return running;
+}
+
+static void bme_sensor_service_publish_latest(const bme690_data_t *sensor_data,
+                                              const bme_air_quality_result_t *air_quality)
+{
+    if (sensor_data == NULL || air_quality == NULL) {
+        return;
+    }
+
+    bme_sensor_air_state_t air_state = BME_SENSOR_AIR_STATE_DEGRADED;
+    if (sensor_data->gas_valid && sensor_data->heat_stable) {
+        air_state = air_quality->baseline_ready ? BME_SENSOR_AIR_STATE_READY :
+                                                 BME_SENSOR_AIR_STATE_CALIBRATING;
+    }
+
+    portENTER_CRITICAL(&s_bme_service_lock);
+    s_bme_service.latest_snapshot.valid = true;
+    s_bme_service.latest_snapshot.temperature_c = sensor_data->temperature_c;
+    s_bme_service.latest_snapshot.humidity_percent = sensor_data->humidity_percent;
+    s_bme_service.latest_snapshot.pressure_hpa = sensor_data->pressure_hpa;
+    s_bme_service.latest_snapshot.gas_resistance_ohm = sensor_data->gas_resistance_ohm;
+    s_bme_service.latest_snapshot.air_state = air_state;
+    portEXIT_CRITICAL(&s_bme_service_lock);
 }
 
 static void bme_sensor_service_mark_busy(bool busy)
@@ -210,6 +234,8 @@ esp_err_t bme_sensor_service_tick(void)
         goto done;
     }
 
+    bme_sensor_service_publish_latest(&sensor_data, &air_quality);
+
     ret = bme_server_client_upload_reading(BME_SENSOR_DEVICE_ID,
                                            &sensor_data,
                                            &air_quality);
@@ -242,6 +268,7 @@ esp_err_t bme_sensor_service_start(void)
     s_bme_service.paused = false;
     s_bme_service.busy = false;
     s_bme_service.stop_requested = false;
+    memset(&s_bme_service.latest_snapshot, 0, sizeof(s_bme_service.latest_snapshot));
     portEXIT_CRITICAL(&s_bme_service_lock);
 
     ESP_LOGD(TAG, "BME service registered with C5 event worker");
@@ -342,4 +369,15 @@ bool bme_sensor_service_is_paused(void)
     bool paused = false;
     (void)bme_sensor_service_snapshot(&paused, NULL, NULL, NULL);
     return paused;
+}
+
+void bme_sensor_service_get_latest_snapshot(bme_sensor_snapshot_t *out_snapshot)
+{
+    if (out_snapshot == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_bme_service_lock);
+    *out_snapshot = s_bme_service.latest_snapshot;
+    portEXIT_CRITICAL(&s_bme_service_lock);
 }

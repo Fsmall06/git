@@ -33,6 +33,8 @@ static TaskHandle_t s_system_worker_task;
 static uint64_t s_csi_next_report_ms;
 static bool s_workers_paused;
 static uint32_t s_worker_active_mask;
+static uint32_t s_worker_route_count;
+static c5_lifecycle_state_t s_workers_state = C5_LIFECYCLE_STOPPED;
 static portMUX_TYPE s_worker_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 enum {
@@ -51,7 +53,7 @@ static bool c5_worker_begin(uint32_t active_bit)
 {
     bool allowed = false;
     portENTER_CRITICAL(&s_worker_state_lock);
-    if (!s_workers_paused) {
+    if (s_workers_state == C5_LIFECYCLE_RUNNING && !s_workers_paused) {
         s_worker_active_mask |= active_bit;
         allowed = true;
     }
@@ -64,15 +66,6 @@ static void c5_worker_end(uint32_t active_bit)
     portENTER_CRITICAL(&s_worker_state_lock);
     s_worker_active_mask &= ~active_bit;
     portEXIT_CRITICAL(&s_worker_state_lock);
-}
-
-static bool c5_workers_dispatch_allowed(void)
-{
-    bool allowed;
-    portENTER_CRITICAL(&s_worker_state_lock);
-    allowed = !s_workers_paused;
-    portEXIT_CRITICAL(&s_worker_state_lock);
-    return allowed;
 }
 
 static void c5_worker_record_latency(const c5_event_t *event)
@@ -105,17 +98,34 @@ static void c5_worker_log_ret(const char *worker, const c5_event_t *event, esp_e
              esp_err_to_name(ret));
 }
 
-static esp_err_t c5_worker_enqueue(QueueHandle_t queue, const c5_event_t *event)
+static esp_err_t c5_worker_enqueue(QueueHandle_t *queue, const c5_event_t *event)
 {
     if (queue == NULL || event == NULL) {
         c5_event_bus_note_drop();
         return ESP_ERR_INVALID_STATE;
     }
-    if (!c5_workers_dispatch_allowed()) {
+
+    QueueHandle_t worker_queue = NULL;
+    portENTER_CRITICAL(&s_worker_state_lock);
+    if (s_workers_state == C5_LIFECYCLE_RUNNING &&
+        !s_workers_paused &&
+        *queue != NULL) {
+        worker_queue = *queue;
+        s_worker_route_count++;
+    }
+    portEXIT_CRITICAL(&s_worker_state_lock);
+
+    if (worker_queue == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     /* 路由阶段不等待 worker queue；队列满说明下游已经积压，直接计 drop。 */
-    if (xQueueSend(queue, event, 0) != pdTRUE) {
+    BaseType_t sent = xQueueSend(worker_queue, event, 0);
+
+    portENTER_CRITICAL(&s_worker_state_lock);
+    s_worker_route_count--;
+    portEXIT_CRITICAL(&s_worker_state_lock);
+
+    if (sent != pdTRUE) {
         c5_event_bus_note_drop();
         return ESP_ERR_TIMEOUT;
     }
@@ -125,19 +135,19 @@ static esp_err_t c5_worker_enqueue(QueueHandle_t queue, const c5_event_t *event)
 static esp_err_t c5_route_csi_event(const c5_event_t *event, void *ctx)
 {
     (void)ctx;
-    return c5_worker_enqueue(s_csi_worker_queue, event);
+    return c5_worker_enqueue(&s_csi_worker_queue, event);
 }
 
 static esp_err_t c5_route_bme_event(const c5_event_t *event, void *ctx)
 {
     (void)ctx;
-    return c5_worker_enqueue(s_bme_worker_queue, event);
+    return c5_worker_enqueue(&s_bme_worker_queue, event);
 }
 
 static esp_err_t c5_route_system_event(const c5_event_t *event, void *ctx)
 {
     (void)ctx;
-    return c5_worker_enqueue(s_system_worker_queue, event);
+    return c5_worker_enqueue(&s_system_worker_queue, event);
 }
 
 static void csi_worker(void *arg)
@@ -260,59 +270,91 @@ static esp_err_t c5_runtime_workers_create_task(TaskHandle_t *task,
     return ESP_OK;
 }
 
+static esp_err_t c5_runtime_workers_quiesce_internal(uint32_t timeout_ms);
+static esp_err_t c5_runtime_workers_destroy(void);
+
 esp_err_t c5_runtime_workers_start(void)
 {
+    portENTER_CRITICAL(&s_worker_state_lock);
+    if (s_workers_state == C5_LIFECYCLE_RUNNING) {
+        portEXIT_CRITICAL(&s_worker_state_lock);
+        return ESP_OK;
+    }
+    if (s_workers_state != C5_LIFECYCLE_STOPPED) {
+        portEXIT_CRITICAL(&s_worker_state_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_workers_state = C5_LIFECYCLE_STARTING;
+    s_workers_paused = true;
+    portEXIT_CRITICAL(&s_worker_state_lock);
+
     esp_err_t ret = c5_event_bus_init();
     if (ret != ESP_OK) {
+        portENTER_CRITICAL(&s_worker_state_lock);
+        s_workers_state = C5_LIFECYCLE_STOPPED;
+        portEXIT_CRITICAL(&s_worker_state_lock);
         return ret;
     }
 
     /* 三类 worker 拆队列，避免 CSI 高频事件挤占 heartbeat/status/command poll。 */
     ret = c5_runtime_workers_create_queue(&s_csi_worker_queue);
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
     ret = c5_runtime_workers_create_queue(&s_bme_worker_queue);
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
     ret = c5_runtime_workers_create_queue(&s_system_worker_queue);
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
 
     ret = c5_event_bus_register_handler(C5_EVENT_CSI_READY, c5_route_csi_event, NULL);
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
     ret = c5_event_bus_register_handler(C5_EVENT_BME_SAMPLE, c5_route_bme_event, NULL);
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
     ret = c5_event_bus_register_handler(C5_EVENT_HEARTBEAT, c5_route_system_event, NULL);
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
     ret = c5_event_bus_register_handler(C5_EVENT_STATUS, c5_route_system_event, NULL);
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
     ret = c5_event_bus_register_handler(C5_EVENT_COMMAND, c5_route_system_event, NULL);
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
 
     ret = c5_runtime_workers_create_task(&s_csi_worker_task, csi_worker, "csi_worker");
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
     ret = c5_runtime_workers_create_task(&s_bme_worker_task, bme_worker, "bme_worker");
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
     }
+
     ret = c5_runtime_workers_create_task(&s_system_worker_task, system_worker, "system_worker");
     if (ret != ESP_OK) {
-        return ret;
+        goto fail;
+    }
+
+    portENTER_CRITICAL(&s_worker_state_lock);
+    if (s_workers_state == C5_LIFECYCLE_STARTING) {
+        s_workers_state = C5_LIFECYCLE_RUNNING;
+        s_workers_paused = false;
+    } else {
+        ret = ESP_ERR_INVALID_STATE;
+    }
+    portEXIT_CRITICAL(&s_worker_state_lock);
+    if (ret != ESP_OK) {
+        goto fail;
     }
 
     ESP_LOGI(TAG,
@@ -321,13 +363,54 @@ esp_err_t c5_runtime_workers_start(void)
              (unsigned int)C5_WORKER_TASK_STACK,
              (unsigned int)C5_WORKER_QUEUE_LENGTH);
     return ESP_OK;
+
+fail:
+    portENTER_CRITICAL(&s_worker_state_lock);
+    s_workers_state = C5_LIFECYCLE_STOPPING;
+    s_workers_paused = true;
+    portEXIT_CRITICAL(&s_worker_state_lock);
+
+    esp_err_t cleanup_ret = c5_runtime_workers_destroy();
+    portENTER_CRITICAL(&s_worker_state_lock);
+    s_workers_state = cleanup_ret == ESP_OK ? C5_LIFECYCLE_STOPPED : C5_LIFECYCLE_FAULT;
+    portEXIT_CRITICAL(&s_worker_state_lock);
+    if (cleanup_ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "worker startup cleanup failed primary_error=%s cleanup_error=%s",
+                 esp_err_to_name(ret),
+                 esp_err_to_name(cleanup_ret));
+    }
+    return ret;
 }
 
-esp_err_t c5_runtime_workers_quiesce(uint32_t timeout_ms)
+static esp_err_t c5_runtime_workers_quiesce_internal(uint32_t timeout_ms)
 {
     portENTER_CRITICAL(&s_worker_state_lock);
     s_workers_paused = true;
     portEXIT_CRITICAL(&s_worker_state_lock);
+
+    const uint64_t deadline_ms = c5_worker_now_ms() + (uint64_t)timeout_ms;
+    while (true) {
+        uint32_t active_mask;
+        uint32_t route_count;
+
+        portENTER_CRITICAL(&s_worker_state_lock);
+        active_mask = s_worker_active_mask;
+        route_count = s_worker_route_count;
+        portEXIT_CRITICAL(&s_worker_state_lock);
+        if (active_mask == 0U && route_count == 0U) {
+            break;
+        }
+        if (c5_worker_now_ms() >= deadline_ms) {
+            ESP_LOGW(TAG,
+                     "C5 worker quiesce timeout active_mask=0x%lx routes=%lu timeout_ms=%u",
+                     (unsigned long)active_mask,
+                     (unsigned long)route_count,
+                     (unsigned int)timeout_ms);
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 
     if (s_csi_worker_queue != NULL) {
         (void)xQueueReset(s_csi_worker_queue);
@@ -339,30 +422,102 @@ esp_err_t c5_runtime_workers_quiesce(uint32_t timeout_ms)
         (void)xQueueReset(s_system_worker_queue);
     }
 
-    const uint64_t deadline_ms = c5_worker_now_ms() + (uint64_t)timeout_ms;
-    while (true) {
-        uint32_t active_mask;
-        portENTER_CRITICAL(&s_worker_state_lock);
-        active_mask = s_worker_active_mask;
-        portEXIT_CRITICAL(&s_worker_state_lock);
-        if (active_mask == 0U) {
-            ESP_LOGI(TAG, "C5 workers quiesced timeout_ms=%u", (unsigned int)timeout_ms);
-            return ESP_OK;
-        }
-        if (c5_worker_now_ms() >= deadline_ms) {
-            ESP_LOGW(TAG,
-                     "C5 worker quiesce timeout active_mask=0x%lx timeout_ms=%u",
-                     (unsigned long)active_mask,
-                     (unsigned int)timeout_ms);
-            return ESP_ERR_TIMEOUT;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_LOGI(TAG, "C5 workers quiesced timeout_ms=%u", (unsigned int)timeout_ms);
+    return ESP_OK;
+}
+
+static esp_err_t c5_runtime_workers_destroy(void)
+{
+    esp_err_t ret = c5_runtime_workers_quiesce_internal(1000U);
+    if (ret != ESP_OK) {
+        return ret;
     }
+
+    if (s_csi_worker_task != NULL) {
+        vTaskDelete(s_csi_worker_task);
+        s_csi_worker_task = NULL;
+    }
+    if (s_bme_worker_task != NULL) {
+        vTaskDelete(s_bme_worker_task);
+        s_bme_worker_task = NULL;
+    }
+    if (s_system_worker_task != NULL) {
+        vTaskDelete(s_system_worker_task);
+        s_system_worker_task = NULL;
+    }
+
+    if (s_csi_worker_queue != NULL) {
+        vQueueDelete(s_csi_worker_queue);
+        s_csi_worker_queue = NULL;
+    }
+    if (s_bme_worker_queue != NULL) {
+        vQueueDelete(s_bme_worker_queue);
+        s_bme_worker_queue = NULL;
+    }
+    if (s_system_worker_queue != NULL) {
+        vQueueDelete(s_system_worker_queue);
+        s_system_worker_queue = NULL;
+    }
+
+    portENTER_CRITICAL(&s_worker_state_lock);
+    s_csi_next_report_ms = 0U;
+    s_worker_active_mask = 0U;
+    s_worker_route_count = 0U;
+    portEXIT_CRITICAL(&s_worker_state_lock);
+    return ESP_OK;
+}
+
+esp_err_t c5_runtime_workers_quiesce(uint32_t timeout_ms)
+{
+    portENTER_CRITICAL(&s_worker_state_lock);
+    bool running = s_workers_state == C5_LIFECYCLE_RUNNING;
+    portEXIT_CRITICAL(&s_worker_state_lock);
+    if (!running) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return c5_runtime_workers_quiesce_internal(timeout_ms);
+}
+
+esp_err_t c5_runtime_workers_stop(void)
+{
+    portENTER_CRITICAL(&s_worker_state_lock);
+    if (s_workers_state == C5_LIFECYCLE_STOPPED) {
+        portEXIT_CRITICAL(&s_worker_state_lock);
+        return ESP_OK;
+    }
+    if (s_workers_state == C5_LIFECYCLE_STARTING ||
+        s_workers_state == C5_LIFECYCLE_STOPPING) {
+        portEXIT_CRITICAL(&s_worker_state_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_workers_state = C5_LIFECYCLE_STOPPING;
+    s_workers_paused = true;
+    portEXIT_CRITICAL(&s_worker_state_lock);
+
+    esp_err_t ret = c5_runtime_workers_destroy();
+
+    portENTER_CRITICAL(&s_worker_state_lock);
+    s_workers_state = ret == ESP_OK ? C5_LIFECYCLE_STOPPED : C5_LIFECYCLE_FAULT;
+    s_workers_paused = true;
+    portEXIT_CRITICAL(&s_worker_state_lock);
+    return ret;
+}
+
+c5_lifecycle_state_t c5_runtime_workers_get_state(void)
+{
+    c5_lifecycle_state_t state;
+
+    portENTER_CRITICAL(&s_worker_state_lock);
+    state = s_workers_state;
+    portEXIT_CRITICAL(&s_worker_state_lock);
+    return state;
 }
 
 void c5_runtime_workers_resume(void)
 {
     portENTER_CRITICAL(&s_worker_state_lock);
-    s_workers_paused = false;
+    if (s_workers_state == C5_LIFECYCLE_RUNNING) {
+        s_workers_paused = false;
+    }
     portEXIT_CRITICAL(&s_worker_state_lock);
 }
