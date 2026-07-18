@@ -12,6 +12,8 @@
 #include "freertos/portmacro.h"
 #include "lvgl.h"
 
+extern esp_err_t voice_chain_request_local_wake(void);
+
 #define LCD_LVGL_DRAW_BUFFER_LINES 1U
 #define LCD_LVGL_DRAW_BUFFER_PIXELS (LCD_H_RES * LCD_LVGL_DRAW_BUFFER_LINES)
 #define LCD_LVGL_TASK_PRIORITY 1
@@ -23,6 +25,15 @@
 #define LCD_DASHBOARD_LOG_PERIOD_MS 10000LL
 #define LCD_DASHBOARD_MARGIN_X 12
 #define LCD_DASHBOARD_TEXT_WIDTH (LCD_H_RES - (LCD_DASHBOARD_MARGIN_X * 2))
+#define LCD_DASHBOARD_ENV_COLUMN_WIDTH 144
+#define LCD_DASHBOARD_STATUS_DOT_SIZE 6
+#define LCD_DASHBOARD_STATUS_DOT_X 39
+#define LCD_DASHBOARD_AIR_DOT_Y 185
+#define LCD_DASHBOARD_CONNECTION_DOT_X 82
+#define LCD_DASHBOARD_CONNECTION_DOT_Y 258
+#define LCD_DASHBOARD_CONNECTION_LABEL_X 98
+#define LCD_DASHBOARD_CONNECTION_LABEL_Y 253
+#define LCD_DASHBOARD_CONNECTION_LABEL_WIDTH 100
 #define LCD_CAT_ANIMATION_PERIOD_MS 100U
 #define LCD_CAT_WAKE_FRAMES 6U
 #define LCD_CAT_RECORDING_FRAMES 6U
@@ -39,8 +50,8 @@
 #define LCD_CAT_VOICE_IMAGE_STRIDE (LCD_CAT_IMAGE_STRIDE * LCD_CAT_VOICE_SCALE)
 #define LCD_CAT_VOICE_IMAGE_DATA_BYTES (LCD_CAT_IMAGE_PALETTE_BYTES + \
                                         (LCD_CAT_VOICE_IMAGE_STRIDE * LCD_CAT_VOICE_IMAGE_HEIGHT))
-#define LCD_CAT_IMAGE_X 88
-#define LCD_CAT_IMAGE_Y 172
+#define LCD_CAT_IMAGE_X (LCD_H_RES - LCD_DASHBOARD_MARGIN_X - LCD_CAT_IMAGE_WIDTH - 8)
+#define LCD_CAT_IMAGE_Y 180
 #define LCD_VOICE_CAT_IMAGE_X ((LCD_H_RES - LCD_CAT_VOICE_IMAGE_WIDTH) / 2)
 #define LCD_VOICE_CAT_IMAGE_Y ((LCD_V_RES - LCD_CAT_VOICE_IMAGE_HEIGHT) / 2)
 
@@ -55,6 +66,8 @@ static lv_obj_t *s_gas_label;
 static lv_obj_t *s_air_label;
 static lv_obj_t *s_network_label;
 static lv_obj_t *s_voice_label;
+static lv_obj_t *s_air_status_dot;
+static lv_obj_t *s_connection_status_dot;
 static lv_obj_t *s_dashboard_root;
 static lv_obj_t *s_voice_root;
 static lv_obj_t *s_cat_image;
@@ -94,6 +107,17 @@ static void lcd_lvgl_log_memory(const char *stage);
 static void lcd_cat_animation_timer_cb(lv_timer_t *timer);
 static void lcd_voice_animation_timer_cb(lv_timer_t *timer);
 
+static void lcd_dashboard_cat_click_cb(lv_event_t *event)
+{
+    (void)event;
+    esp_err_t ret = voice_chain_request_local_wake();
+    if (ret == ESP_OK || ret == ESP_ERR_NOT_FINISHED) {
+        ESP_LOGI(TAG, "dashboard cat wake request accepted");
+    } else {
+        ESP_LOGW(TAG, "dashboard cat wake request rejected: %s", esp_err_to_name(ret));
+    }
+}
+
 static lv_obj_t *lcd_lvgl_create_label(lv_obj_t *parent,
                                         const char *text,
                                         lv_color_t color,
@@ -111,18 +135,54 @@ static lv_obj_t *lcd_lvgl_create_label(lv_obj_t *parent,
     return label;
 }
 
+static lv_obj_t *lcd_lvgl_create_status_dot(lv_obj_t *parent, int16_t x, int16_t y)
+{
+    lv_obj_t *dot = lv_obj_create(parent);
+    if (dot == NULL) {
+        return NULL;
+    }
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_pos(dot, x, y);
+    lv_obj_set_size(dot, 8, 8);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    return dot;
+}
+
+static void lcd_lvgl_set_status_dot_color(lv_obj_t *dot, lv_color_t color)
+{
+    if (dot != NULL) {
+        lv_obj_set_style_bg_color(dot, color, 0);
+    }
+}
+
 static const char *lcd_dashboard_air_state_name(lcd_dashboard_air_state_t state)
 {
     switch (state) {
     case LCD_DASHBOARD_AIR_READY:
-        return "READY";
+        return "GOOD";
     case LCD_DASHBOARD_AIR_DEGRADED:
-        return "DEGRADED";
+        return "BAD";
     case LCD_DASHBOARD_AIR_CALIBRATING:
-        return "CALIBRATING";
+        return "CALIB";
     case LCD_DASHBOARD_AIR_INIT:
     default:
         return "INIT";
+    }
+}
+
+static lv_color_t lcd_dashboard_air_state_color(lcd_dashboard_air_state_t state)
+{
+    switch (state) {
+    case LCD_DASHBOARD_AIR_READY:
+        return lv_color_hex(0x79D2A6);
+    case LCD_DASHBOARD_AIR_DEGRADED:
+        return lv_color_hex(0xE56B6F);
+    case LCD_DASHBOARD_AIR_CALIBRATING:
+    case LCD_DASHBOARD_AIR_INIT:
+    default:
+        return lv_color_hex(0xE5B75B);
     }
 }
 
@@ -142,6 +202,24 @@ static const char *lcd_dashboard_voice_state_name(lcd_dashboard_voice_state_t st
     case LCD_DASHBOARD_VOICE_LISTEN:
     default:
         return "LISTEN";
+    }
+}
+
+static const char *lcd_dashboard_voice_assistant_text(lcd_dashboard_voice_state_t state)
+{
+    switch (state) {
+    case LCD_DASHBOARD_VOICE_REC:
+        return "REC";
+    case LCD_DASHBOARD_VOICE_PLAY:
+        return "PLAY";
+    case LCD_DASHBOARD_VOICE_ERR:
+        return "ERROR";
+    case LCD_DASHBOARD_VOICE_WAKE:
+    case LCD_DASHBOARD_VOICE_WAIT:
+        return "LISTEN";
+    case LCD_DASHBOARD_VOICE_LISTEN:
+    default:
+        return "IDLE";
     }
 }
 
@@ -495,6 +573,8 @@ static bool lcd_cat_create(lv_obj_t *screen)
     }
     s_cat_frame = NULL;
     lcd_cat_set_frame(&s_cat_listen, 0, 0);
+    lv_obj_add_flag(s_cat_image, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_cat_image, lcd_dashboard_cat_click_cb, LV_EVENT_CLICKED, NULL);
 
     s_cat_animation_timer = lv_timer_create(lcd_cat_animation_timer_cb,
                                              LCD_CAT_ANIMATION_PERIOD_MS,
@@ -809,28 +889,44 @@ static void lcd_lvgl_update_dashboard(const lcd_dashboard_snapshot_t *snapshot,
         return;
     }
 
+    lv_color_t air_color = lcd_dashboard_air_state_color(LCD_DASHBOARD_AIR_INIT);
     if (snapshot->bme_valid) {
         (void)snprintf(s_temp_text, sizeof(s_temp_text),
-                       "Temp      %.1f \xC2\xB0" "C", (double)snapshot->temperature_c);
-        (void)snprintf(s_humidity_text, sizeof(s_humidity_text), "Humidity  %.1f %%", (double)snapshot->humidity_percent);
-        (void)snprintf(s_pressure_text, sizeof(s_pressure_text), "Pressure  %.1f hPa", (double)snapshot->pressure_hpa);
-        (void)snprintf(s_gas_text, sizeof(s_gas_text), "Gas       %.1f kOhm",
+                       "TEMP   %.1f \xC2\xB0" "C", (double)snapshot->temperature_c);
+        (void)snprintf(s_humidity_text, sizeof(s_humidity_text), "HUM    %.1f %%", (double)snapshot->humidity_percent);
+        (void)snprintf(s_pressure_text, sizeof(s_pressure_text), "PRESS  %.1f hPa", (double)snapshot->pressure_hpa);
+        (void)snprintf(s_gas_text, sizeof(s_gas_text), "GAS    %.1f kOhm",
                        (double)snapshot->gas_resistance_ohm / 1000.0);
-        (void)snprintf(s_air_text, sizeof(s_air_text), "Air       %s",
+        (void)snprintf(s_air_text, sizeof(s_air_text), "AIR    %s",
                        lcd_dashboard_air_state_name(snapshot->air_state));
+        air_color = lcd_dashboard_air_state_color(snapshot->air_state);
     } else {
-        (void)snprintf(s_temp_text, sizeof(s_temp_text), "Temp      --.- \xC2\xB0" "C");
-        (void)snprintf(s_humidity_text, sizeof(s_humidity_text), "Humidity  --.- %%");
-        (void)snprintf(s_pressure_text, sizeof(s_pressure_text), "Pressure  ----.- hPa");
-        (void)snprintf(s_gas_text, sizeof(s_gas_text), "Gas       --.- kOhm");
-        (void)snprintf(s_air_text, sizeof(s_air_text), "Air       INIT");
+        (void)snprintf(s_temp_text, sizeof(s_temp_text), "TEMP   --.- \xC2\xB0" "C");
+        (void)snprintf(s_humidity_text, sizeof(s_humidity_text), "HUM    --.- %%");
+        (void)snprintf(s_pressure_text, sizeof(s_pressure_text), "PRESS  ----.- hPa");
+        (void)snprintf(s_gas_text, sizeof(s_gas_text), "GAS    --.- kOhm");
+        (void)snprintf(s_air_text, sizeof(s_air_text), "AIR    INIT");
     }
 
-    (void)snprintf(s_network_text, sizeof(s_network_text), "NET  %s   S3  %s",
-                   snapshot->network_ok ? "OK" : "OFF",
-                   snapshot->gateway_ok ? "OK" : "OFF");
-    (void)snprintf(s_voice_text, sizeof(s_voice_text), "VOICE %s",
-                   lcd_dashboard_voice_state_name(snapshot->voice_state));
+    const char *connection_text;
+    lv_color_t connection_color;
+    if (snapshot->network_ok && snapshot->gateway_ok) {
+        connection_text = "Online";
+        connection_color = lv_color_hex(0x79D2A6);
+    } else if (snapshot->network_ok) {
+        connection_text = "Connecting";
+        connection_color = lv_color_hex(0xE5B75B);
+    } else {
+        connection_text = "Offline";
+        connection_color = lv_color_hex(0xE56B6F);
+    }
+    (void)snprintf(s_network_text, sizeof(s_network_text), "%s", connection_text);
+    lv_obj_set_style_text_color(s_air_label, air_color, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_network_label, connection_color, LV_PART_MAIN);
+    lcd_lvgl_set_status_dot_color(s_air_status_dot, air_color);
+    lcd_lvgl_set_status_dot_color(s_connection_status_dot, connection_color);
+    (void)snprintf(s_voice_text, sizeof(s_voice_text), "%s",
+                   lcd_dashboard_voice_assistant_text(snapshot->voice_state));
 
     lcd_lvgl_set_static_text(s_temp_label, s_temp_text);
     lcd_lvgl_set_static_text(s_humidity_label, s_humidity_text);
@@ -943,20 +1039,46 @@ static esp_err_t lcd_lvgl_create_status_ui(void)
     const lv_color_t section_color = lv_color_hex(0x79D2A6);
     const lv_color_t value_color = lv_color_hex(0xDCE7EF);
     lv_obj_t *title = lcd_lvgl_create_label(s_dashboard_root, "SensAir C5", title_color, 12);
-    lv_obj_t *environment = lcd_lvgl_create_label(s_dashboard_root, "ENVIRONMENT", section_color, 40);
-    s_temp_label = lcd_lvgl_create_label(s_dashboard_root, s_temp_text, value_color, 60);
-    s_humidity_label = lcd_lvgl_create_label(s_dashboard_root, s_humidity_text, value_color, 82);
-    s_pressure_label = lcd_lvgl_create_label(s_dashboard_root, s_pressure_text, value_color, 104);
-    s_gas_label = lcd_lvgl_create_label(s_dashboard_root, s_gas_text, value_color, 126);
-    s_air_label = lcd_lvgl_create_label(s_dashboard_root, s_air_text, section_color, 148);
-    s_network_label = lcd_lvgl_create_label(s_dashboard_root, s_network_text, section_color, 238);
-    s_voice_label = lcd_lvgl_create_label(s_dashboard_root, s_voice_text, title_color, 258);
+    lv_obj_t *environment = lcd_lvgl_create_label(s_dashboard_root, "ENVIRONMENT", section_color, 44);
+    s_temp_label = lcd_lvgl_create_label(s_dashboard_root, s_temp_text, value_color, 72);
+    s_humidity_label = lcd_lvgl_create_label(s_dashboard_root, s_humidity_text, value_color, 99);
+    s_pressure_label = lcd_lvgl_create_label(s_dashboard_root, s_pressure_text, value_color, 126);
+    s_gas_label = lcd_lvgl_create_label(s_dashboard_root, s_gas_text, value_color, 153);
+    s_air_label = lcd_lvgl_create_label(s_dashboard_root, s_air_text, section_color, 182);
+    s_network_label = lcd_lvgl_create_label(s_dashboard_root, s_network_text, section_color,
+                                            LCD_DASHBOARD_CONNECTION_LABEL_Y);
+    s_voice_label = lcd_lvgl_create_label(s_dashboard_root, s_voice_text, title_color, 0);
     if (title == NULL || environment == NULL || s_temp_label == NULL || s_humidity_label == NULL ||
         s_pressure_label == NULL || s_gas_label == NULL || s_air_label == NULL ||
         s_network_label == NULL || s_voice_label == NULL) {
         lvgl_port_unlock();
         return ESP_ERR_NO_MEM;
     }
+    s_air_status_dot = lcd_lvgl_create_status_dot(s_dashboard_root,
+                                                   LCD_DASHBOARD_STATUS_DOT_X,
+                                                   LCD_DASHBOARD_AIR_DOT_Y);
+    s_connection_status_dot = lcd_lvgl_create_status_dot(s_dashboard_root,
+                                                          LCD_DASHBOARD_CONNECTION_DOT_X,
+                                                          LCD_DASHBOARD_CONNECTION_DOT_Y);
+    if (s_air_status_dot == NULL || s_connection_status_dot == NULL) {
+        lvgl_port_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_set_pos(s_network_label,
+                   LCD_DASHBOARD_CONNECTION_LABEL_X,
+                   LCD_DASHBOARD_CONNECTION_LABEL_Y);
+    lv_obj_set_width(s_network_label, LCD_DASHBOARD_CONNECTION_LABEL_WIDTH);
+    lv_obj_set_height(s_network_label, 18);
+    lv_obj_set_width(s_temp_label, LCD_DASHBOARD_ENV_COLUMN_WIDTH);
+    lv_obj_set_width(s_humidity_label, LCD_DASHBOARD_ENV_COLUMN_WIDTH);
+    lv_obj_set_width(s_pressure_label, LCD_DASHBOARD_ENV_COLUMN_WIDTH);
+    lv_obj_set_width(s_gas_label, LCD_DASHBOARD_ENV_COLUMN_WIDTH);
+    lv_obj_set_width(s_air_label, LCD_DASHBOARD_ENV_COLUMN_WIDTH);
+    lv_obj_set_pos(s_voice_label,
+                   LCD_CAT_IMAGE_X,
+                   LCD_CAT_IMAGE_Y + LCD_CAT_IMAGE_HEIGHT + 2);
+    lv_obj_set_width(s_voice_label, LCD_CAT_IMAGE_WIDTH);
+    lv_obj_set_style_text_align(s_voice_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
 
     lcd_lvgl_log_memory("before_cat_create");
     (void)lcd_cat_create(s_dashboard_root);

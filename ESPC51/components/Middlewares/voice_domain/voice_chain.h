@@ -50,6 +50,13 @@ typedef enum {
  */
 esp_err_t voice_chain_start(void);
 
+/**
+ * @brief 请求一次与本地 WakeNet 检测等价的唤醒。
+ *
+ * 成功时复用现有 wake_ack 资源租约、Mic 暂停和事件处理路径；不直接操作 speaker。
+ */
+esp_err_t voice_chain_request_local_wake(void);
+
 /** @brief 获取当前 voice_chain 状态；状态页、日志或调试命令调用，返回枚举值。 */
 voice_chain_state_t voice_chain_get_state(void);
 

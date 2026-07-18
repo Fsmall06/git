@@ -705,6 +705,12 @@ static esp_err_t voice_chain_prepare_for_server_voice_start(void *user_ctx)
     return ESP_OK;
 }
 
+esp_err_t voice_chain_request_local_wake(void)
+{
+    ESP_LOGI(TAG, "manual local wake requested");
+    return voice_chain_prepare_for_server_voice_start(NULL);
+}
+
 static esp_err_t voice_chain_server_voice_append_pcm(const int16_t *pcm,
                                                      size_t samples,
                                                      void *user_ctx)
