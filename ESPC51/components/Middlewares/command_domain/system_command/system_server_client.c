@@ -23,6 +23,7 @@
 #include "c5_memory.h"
 #include "device_protocol_metadata.h"
 #include "esp111_protocol_common.h"
+#include "gateway_link.h"
 #include "screen_service.h"
 #include "server_comm_config.h"
 #include "server_comm_http.h"
@@ -754,6 +755,9 @@ esp_err_t system_server_client_init(void)
     if (s_capabilities_registered) {
         return ESP_OK;
     }
+    if (!gateway_link_is_ready()) {
+        return ESP_OK;
+    }
 
     system_server_client_scratch_t *scratch = NULL;
     esp_err_t ret = system_server_client_take_scratch(&scratch);
@@ -795,6 +799,15 @@ esp_err_t system_server_client_init(void)
     }
     system_server_client_give_scratch();
     return ret;
+}
+
+static esp_err_t system_server_client_ensure_registered(void)
+{
+    esp_err_t ret = system_server_client_init();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    return s_capabilities_registered ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 static esp_err_t system_server_client_post_health_update(const char *endpoint,
@@ -845,6 +858,10 @@ static esp_err_t system_server_client_post_health_update(const char *endpoint,
 
 esp_err_t system_server_client_send_heartbeat(const char *device_id)
 {
+    esp_err_t ret = system_server_client_ensure_registered();
+    if (ret != ESP_OK) {
+        return ret;
+    }
     return system_server_client_post_health_update(SYSTEM_COMMAND_HEARTBEAT_ENDPOINT,
                                                    device_id,
                                                    ESP111_PROTOCOL_LOCAL_HEALTH_HEARTBEAT);
@@ -852,6 +869,10 @@ esp_err_t system_server_client_send_heartbeat(const char *device_id)
 
 esp_err_t system_server_client_send_status(const char *device_id)
 {
+    esp_err_t ret = system_server_client_ensure_registered();
+    if (ret != ESP_OK) {
+        return ret;
+    }
     return system_server_client_post_health_update(SYSTEM_COMMAND_STATUS_ENDPOINT,
                                                    device_id,
                                                    ESP111_PROTOCOL_LOCAL_HEALTH_STATUS);
@@ -863,7 +884,7 @@ esp_err_t system_server_client_poll_commands(const char *device_id)
         (device_id != NULL && device_id[0] != '\0') ? device_id : server_comm_get_device_id();
 
     if (!s_capabilities_registered) {
-        esp_err_t register_ret = system_server_client_init();
+        esp_err_t register_ret = system_server_client_ensure_registered();
         if (register_ret != ESP_OK) {
             return register_ret;
         }

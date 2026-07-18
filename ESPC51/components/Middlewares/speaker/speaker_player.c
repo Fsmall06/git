@@ -565,9 +565,18 @@ static void speaker_player_writer_complete_turn(audio_player_stream_ctx_t *ctx,
         return;
     }
 
-    /* The persistent writer owns the per-turn I2S disable transition. */
-    (void)iis_stop();
-    __atomic_store_n(&s_speaker_active, false, __ATOMIC_RELEASE);
+    /* Publish inactive only after the writer has actually stopped IIS. */
+    ESP_LOGI(TAG, "SPEAKER_STOP_BEGIN timestamp=%lld", esp_timer_get_time());
+    esp_err_t stop_err = iis_stop();
+    if (stop_err == ESP_OK) {
+        __atomic_store_n(&s_speaker_active, false, __ATOMIC_RELEASE);
+        ESP_LOGI(TAG, "SPEAKER_ACTIVE_OFF timestamp=%lld", esp_timer_get_time());
+    } else {
+        ESP_LOGE(TAG, "speaker IIS stop failed: %s", esp_err_to_name(stop_err));
+        if (result == ESP_OK) {
+            result = stop_err;
+        }
+    }
     ctx->result = result;
     ctx->writer_stack_high_water_bytes = app_stack_monitor_high_water();
     ctx->writer_done = true;
@@ -901,7 +910,6 @@ static void speaker_player_reset_turn_locked(audio_player_stream_ctx_t *ctx)
     ctx->ring_high_water = 0;
     ctx->ring_backpressure_count = 0;
     s_pcm_stream_open = false;
-    __atomic_store_n(&s_speaker_active, false, __ATOMIC_RELEASE);
     s_pcm_stream_owner_task = NULL;
     s_pcm_stream_sequence = 0;
     s_pcm_player_state = AUDIO_PLAYER_STATE_READY_DISABLED;
@@ -1170,6 +1178,7 @@ esp_err_t audio_player_release_session(uint32_t timeout_ms)
         xSemaphoreGive(s_play_mutex);
         return err;
     }
+    __atomic_store_n(&s_speaker_active, false, __ATOMIC_RELEASE);
     if (s_pcm_stream_ctx.scratch_item != NULL) {
         c5_mem_free(s_pcm_stream_ctx.scratch_item, "speaker_ring_scratch");
         s_pcm_stream_ctx.scratch_item = NULL;

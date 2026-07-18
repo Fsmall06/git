@@ -213,7 +213,9 @@ bool c5_should_run(c5_task_type_t task_type)
     if (state.voice_active) {
         return false;
     }
-    if (state.gateway_state != LINK_READY) {
+    /* BME sampling publishes a local display snapshot and does not require a
+     * gateway. All other normal tasks remain blocked until LINK_READY. */
+    if (state.gateway_state != LINK_READY && task_type != C5_TASK_TYPE_BME_SENSOR) {
         return false;
     }
     if (state.cpu_idle_estimate < C5_BACKPRESSURE_CRITICAL_CPU_IDLE) {
@@ -268,7 +270,8 @@ uint32_t c5_get_interval(c5_task_type_t task_type)
         return c5_clamp_interval(C5_BACKPRESSURE_VOICE_BACKOFF_MS);
     }
 
-    if (state.gateway_state != LINK_READY && priority != C5_TASK_PRIORITY_HIGH) {
+    if (state.gateway_state != LINK_READY && priority != C5_TASK_PRIORITY_HIGH &&
+        task_type != C5_TASK_TYPE_BME_SENSOR) {
         interval_ms *= 2U;
     }
     if (state.queue_load >= C5_BACKPRESSURE_HIGH_QUEUE_LOAD) {

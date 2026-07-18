@@ -210,6 +210,7 @@ function createRealtimeTtsEventSource(text, config, signal, options = {}) {
             let sessionUpdated = false;
             while (!controller.signal.aborted) {
                 const event = parseTtsRealtimeEvent(await ws.nextMessage(controller.signal));
+                console.info(`TTS_REAL_EVENT type=${event.eventName || "<empty>"}`);
                 if (event.isError) {
                     throw createVoiceStageError("tts", "VOICE_TTS_FAILED", event.errorMessage || "TTS Realtime WebSocket returned an error", 502, {
                         endpoint: config.tts.url,
@@ -243,7 +244,9 @@ function createRealtimeTtsEventSource(text, config, signal, options = {}) {
             }));
 
             while (!controller.signal.aborted) {
-                yield parseTtsRealtimeEvent(await ws.nextMessage(controller.signal));
+                const event = parseTtsRealtimeEvent(await ws.nextMessage(controller.signal));
+                console.info(`TTS_REAL_EVENT type=${event.eventName || "<empty>"}`);
+                yield event;
             }
         } finally {
             signal?.removeEventListener("abort", onParentAbort);

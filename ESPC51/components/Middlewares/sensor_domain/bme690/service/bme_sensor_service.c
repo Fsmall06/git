@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "gateway_link.h"
 
 static const char *TAG = "bme_sensor_service";
 
@@ -236,17 +237,19 @@ esp_err_t bme_sensor_service_tick(void)
 
     bme_sensor_service_publish_latest(&sensor_data, &air_quality);
 
-    ret = bme_server_client_upload_reading(BME_SENSOR_DEVICE_ID,
-                                           &sensor_data,
-                                           &air_quality);
-    if (ret == ESP_OK) {
-        ESP_LOGD(TAG, "BME upload success");
-    } else if (ret == ESP_ERR_INVALID_STATE && app_runtime_non_voice_is_paused()) {
-        app_runtime_log_voice_busy_skip("BME upload");
-    } else {
-        ESP_LOGW(TAG, "BME upload fail: %s", esp_err_to_name(ret));
-        app_stack_monitor_log(TAG, "bme_sensor_tick", "upload_error");
-        bme_sensor_service_log_heap("BME upload fail heap");
+    if (gateway_link_is_ready()) {
+        ret = bme_server_client_upload_reading(BME_SENSOR_DEVICE_ID,
+                                               &sensor_data,
+                                               &air_quality);
+        if (ret == ESP_OK) {
+            ESP_LOGD(TAG, "BME upload success");
+        } else if (ret == ESP_ERR_INVALID_STATE && app_runtime_non_voice_is_paused()) {
+            app_runtime_log_voice_busy_skip("BME upload");
+        } else {
+            ESP_LOGW(TAG, "BME upload fail: %s", esp_err_to_name(ret));
+            app_stack_monitor_log(TAG, "bme_sensor_tick", "upload_error");
+            bme_sensor_service_log_heap("BME upload fail heap");
+        }
     }
 
 done:

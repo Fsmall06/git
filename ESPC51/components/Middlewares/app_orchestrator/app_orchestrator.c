@@ -122,6 +122,19 @@ void app_orchestrator_start(void)
     app_stack_monitor_log(TAG, "app_startup_task", "orchestrator_enter");
     c5_mem_log("startup");
 
+    /* Start the local dashboard before any network readiness gate. Its provider
+     * reads published snapshots only, so unavailable services render their
+     * initial state until they come online. */
+    lcd_service_set_snapshot_provider(app_lcd_dashboard_snapshot, NULL);
+    ESP_LOGI(TAG, "LCD_START_BEGIN");
+    esp_err_t lcd_ret = lcd_service_start();
+    if (lcd_ret != ESP_OK) {
+        ESP_LOGW(TAG, "LCD/LVGL service start failed: %s", esp_err_to_name(lcd_ret));
+    } else {
+        ESP_LOGI(TAG, "LCD_START_DONE");
+    }
+    app_stack_monitor_log(TAG, "app_startup_task", "after_lcd_service_start");
+
     /*
      * 启动流程边界：
      * 1. WiFi 只连接 S3 SoftAP；
@@ -136,6 +149,32 @@ void app_orchestrator_start(void)
 
     ESP_ERROR_CHECK(gateway_link_start());
     app_stack_monitor_log(TAG, "app_startup_task", "after_gateway_link_start");
+
+    /* These services only register local state and workers here. Network work
+     * remains gated by gateway readiness inside the runtime controller. */
+    esp_err_t system_ret = system_service_init();
+    if (system_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Local gateway system service init failed: %s", esp_err_to_name(system_ret));
+    }
+    app_stack_monitor_log(TAG, "app_startup_task", "after_system_service_init");
+
+    if (MAIN_ENABLE_BME_SERVICE) {
+        esp_err_t bme_ret = bme_sensor_service_start();
+        if (bme_ret != ESP_OK) {
+            ESP_LOGE(TAG, "BME service start failed: %s", esp_err_to_name(bme_ret));
+        } else {
+            c5_mem_log("after_bme_start");
+        }
+    } else {
+        ESP_LOGI(TAG, "BME service disabled by MAIN_ENABLE_BME_SERVICE");
+    }
+    app_stack_monitor_log(TAG, "app_startup_task", "after_bme_service_start");
+
+    esp_err_t scheduler_ret = c5_scheduler_start();
+    if (scheduler_ret != ESP_OK) {
+        ESP_LOGE(TAG, "C5 runtime dispatcher start failed: %s", esp_err_to_name(scheduler_ret));
+    }
+    app_stack_monitor_log(TAG, "app_startup_task", "after_c5_scheduler_start");
 
     // C5 terminal 正式模式只连接 ESPS3 SoftAP，不连接家庭 WiFi。
     if (wifi_connect_to_ap() != ESP_OK) {
@@ -170,12 +209,6 @@ void app_orchestrator_start(void)
              (unsigned int)heap_caps_get_free_size(MALLOC_CAP_8BIT),
              (unsigned int)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
              (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
-    esp_err_t system_ret = system_service_init();
-    if (system_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Local gateway system service init failed: %s", esp_err_to_name(system_ret));
-    }
-    app_stack_monitor_log(TAG, "app_startup_task", "after_system_service_init");
 
 #if MAIN_ENABLE_CSI_SERVICE
     /*
@@ -218,28 +251,6 @@ void app_orchestrator_start(void)
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_speaker_self_test_gate");
 
-    if (MAIN_ENABLE_BME_SERVICE) {
-        /*
-         * WiFi 稳定后先启动 BME690 后台服务。语音链路进入 local gateway voice turn 时，
-         * voice_chain 会暂停本服务，S3 回传 PCM 播放完成并恢复 Mic 监听后再恢复。
-         */
-        esp_err_t bme_ret = bme_sensor_service_start();
-        if (bme_ret != ESP_OK) {
-            ESP_LOGE(TAG, "BME service start failed: %s", esp_err_to_name(bme_ret));
-        } else {
-            c5_mem_log("after_bme_start");
-        }
-    } else {
-        ESP_LOGI(TAG, "BME service disabled by MAIN_ENABLE_BME_SERVICE");
-    }
-    app_stack_monitor_log(TAG, "app_startup_task", "after_bme_service_start");
-
-    esp_err_t scheduler_ret = c5_scheduler_start();
-    if (scheduler_ret != ESP_OK) {
-        ESP_LOGE(TAG, "C5 runtime dispatcher start failed: %s", esp_err_to_name(scheduler_ret));
-    }
-    app_stack_monitor_log(TAG, "app_startup_task", "after_c5_scheduler_start");
-
     if (MAIN_ENABLE_MIC_CHAIN) {
         /*
          * WiFi 稳定后启动完整本地网关半双工语音链路：
@@ -254,12 +265,6 @@ void app_orchestrator_start(void)
     }
     app_stack_monitor_log(TAG, "app_startup_task", "after_voice_chain_start");
 
-    lcd_service_set_snapshot_provider(app_lcd_dashboard_snapshot, NULL);
-    esp_err_t lcd_ret = lcd_service_start();
-    if (lcd_ret != ESP_OK) {
-        ESP_LOGW(TAG, "LCD/LVGL service start failed: %s", esp_err_to_name(lcd_ret));
-    }
-    app_stack_monitor_log(TAG, "app_startup_task", "after_lcd_service_start");
     // WiFi 重连、Mic ADC/VAD、本地 voice turn、speaker PCM 播放和 C5 runtime 都在后台任务中运行。
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(MAIN_IDLE_DELAY_MS));

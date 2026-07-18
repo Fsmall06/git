@@ -33,10 +33,16 @@
 #define LCD_CAT_IMAGE_PALETTE_BYTES 64U
 #define LCD_CAT_IMAGE_DATA_BYTES (LCD_CAT_IMAGE_PALETTE_BYTES + \
                                   (LCD_CAT_IMAGE_STRIDE * LCD_CAT_IMAGE_HEIGHT))
+#define LCD_CAT_VOICE_SCALE 2U
+#define LCD_CAT_VOICE_IMAGE_WIDTH (LCD_CAT_IMAGE_WIDTH * LCD_CAT_VOICE_SCALE)
+#define LCD_CAT_VOICE_IMAGE_HEIGHT (LCD_CAT_IMAGE_HEIGHT * LCD_CAT_VOICE_SCALE)
+#define LCD_CAT_VOICE_IMAGE_STRIDE (LCD_CAT_IMAGE_STRIDE * LCD_CAT_VOICE_SCALE)
+#define LCD_CAT_VOICE_IMAGE_DATA_BYTES (LCD_CAT_IMAGE_PALETTE_BYTES + \
+                                        (LCD_CAT_VOICE_IMAGE_STRIDE * LCD_CAT_VOICE_IMAGE_HEIGHT))
 #define LCD_CAT_IMAGE_X 88
 #define LCD_CAT_IMAGE_Y 172
-#define LCD_VOICE_CAT_IMAGE_X 88
-#define LCD_VOICE_CAT_IMAGE_Y 104
+#define LCD_VOICE_CAT_IMAGE_X ((LCD_H_RES - LCD_CAT_VOICE_IMAGE_WIDTH) / 2)
+#define LCD_VOICE_CAT_IMAGE_Y ((LCD_V_RES - LCD_CAT_VOICE_IMAGE_HEIGHT) / 2)
 
 static const char *TAG = "LCD_LVGL";
 static const char *MEM_TAG = "LVGL_MEM";
@@ -160,6 +166,14 @@ static void lcd_lvgl_set_static_text(lv_obj_t *label, const char *text)
     CAT_BLOCK(i) CAT_BLOCK(j) CAT_BLOCK(k) CAT_BLOCK(l) \
     CAT_BLOCK(m) CAT_BLOCK(n) CAT_BLOCK(o) CAT_BLOCK(p)
 #define CAT_REPEAT2(row) row row
+#define CAT_BLOCK_X2(c) CAT_NIBBLE_PAIR_##c, CAT_NIBBLE_PAIR_##c, \
+                        CAT_NIBBLE_PAIR_##c, CAT_NIBBLE_PAIR_##c,
+#define CAT_ROW16_X2(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) \
+    CAT_BLOCK_X2(a) CAT_BLOCK_X2(b) CAT_BLOCK_X2(c) CAT_BLOCK_X2(d) \
+    CAT_BLOCK_X2(e) CAT_BLOCK_X2(f) CAT_BLOCK_X2(g) CAT_BLOCK_X2(h) \
+    CAT_BLOCK_X2(i) CAT_BLOCK_X2(j) CAT_BLOCK_X2(k) CAT_BLOCK_X2(l) \
+    CAT_BLOCK_X2(m) CAT_BLOCK_X2(n) CAT_BLOCK_X2(o) CAT_BLOCK_X2(p)
+#define CAT_REPEAT4(row) row row row row
 
 /* The fixed 16 x 24 pixel-art grid is expanded to the 64 x 48 I4 source. */
 #define CAT_ROW_CLEAR CAT_ROW16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -179,6 +193,23 @@ static void lcd_lvgl_set_static_text(lv_obj_t *label, const char *text)
 #define CAT_ROW_FACE_LOWER CAT_ROW16(0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0)
 #define CAT_ROW_PAW CAT_ROW16(0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0)
 #define CAT_ROW_PAW_PAD CAT_ROW16(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0)
+#define CAT_ROW_CLEAR_X2 CAT_ROW16_X2(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+#define CAT_ROW_EAR_TIP_X2 CAT_ROW16_X2(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0)
+#define CAT_ROW_EAR_UPPER_X2 CAT_ROW16_X2(0, 0, 1, 3, 1, 0, 0, 0, 0, 0, 0, 1, 3, 1, 0, 0)
+#define CAT_ROW_EAR_BASE_X2 CAT_ROW16_X2(0, 1, 3, 3, 1, 1, 0, 0, 0, 0, 1, 1, 3, 3, 1, 0)
+#define CAT_ROW_FACE_TOP_X2 CAT_ROW16_X2(0, 1, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 1, 0)
+#define CAT_ROW_FACE_X2 CAT_ROW16_X2(0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0)
+#define CAT_ROW_LISTEN_EYES_X2 CAT_ROW16_X2(0, 1, 1, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 1, 1, 0)
+#define CAT_ROW_OPEN_EYES_X2 CAT_ROW16_X2(0, 1, 1, 1, 1, 2, 1, 1, 1, 1, 2, 1, 1, 1, 1, 0)
+#define CAT_ROW_ERROR_EYES_A_X2 CAT_ROW16_X2(0, 1, 1, 1, 1, 2, 1, 1, 1, 1, 2, 1, 1, 1, 1, 0)
+#define CAT_ROW_ERROR_EYES_B_X2 CAT_ROW16_X2(0, 1, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 1, 1, 0)
+#define CAT_ROW_CHEEKS_X2 CAT_ROW16_X2(2, 2, 1, 4, 4, 1, 1, 1, 1, 1, 1, 4, 4, 1, 2, 2)
+#define CAT_ROW_NOSE_X2 CAT_ROW16_X2(0, 2, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1, 1, 1, 2, 0)
+#define CAT_ROW_MOUTH_CLOSED_X2 CAT_ROW16_X2(0, 0, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 0, 0)
+#define CAT_ROW_MOUTH_OPEN_X2 CAT_ROW16_X2(0, 0, 1, 1, 1, 1, 1, 2, 2, 1, 1, 1, 1, 1, 0, 0)
+#define CAT_ROW_FACE_LOWER_X2 CAT_ROW16_X2(0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0)
+#define CAT_ROW_PAW_X2 CAT_ROW16_X2(0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0)
+#define CAT_ROW_PAW_PAD_X2 CAT_ROW16_X2(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0)
 #define CAT_I4_PALETTE \
     0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, \
     0x54, 0x3d, 0x2a, 0xff, 0xa6, 0xd2, 0x79, 0xff, \
@@ -269,11 +300,97 @@ static const uint8_t s_cat_error_map[] __attribute__((aligned(4))) = {
     CAT_REPEAT2(CAT_ROW_CLEAR) CAT_REPEAT2(CAT_ROW_CLEAR)
 };
 
+/* Voice-screen frames are exact 2x nearest-neighbor expansions of the source I4 cats. */
+static const uint8_t s_cat_listen_voice_map[] __attribute__((aligned(4))) = {
+    CAT_I4_PALETTE
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_EAR_TIP_X2)
+    CAT_REPEAT4(CAT_ROW_EAR_UPPER_X2) CAT_REPEAT4(CAT_ROW_EAR_BASE_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_TOP_X2) CAT_REPEAT4(CAT_ROW_FACE_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_X2) CAT_REPEAT4(CAT_ROW_LISTEN_EYES_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_X2) CAT_REPEAT4(CAT_ROW_CHEEKS_X2)
+    CAT_REPEAT4(CAT_ROW_NOSE_X2) CAT_REPEAT4(CAT_ROW_MOUTH_CLOSED_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2) CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2) CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+};
+
+static const uint8_t s_cat_open_voice_map[] __attribute__((aligned(4))) = {
+    CAT_I4_PALETTE
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_EAR_TIP_X2)
+    CAT_REPEAT4(CAT_ROW_EAR_UPPER_X2) CAT_REPEAT4(CAT_ROW_EAR_BASE_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_TOP_X2) CAT_REPEAT4(CAT_ROW_FACE_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_X2) CAT_REPEAT4(CAT_ROW_OPEN_EYES_X2)
+    CAT_REPEAT4(CAT_ROW_OPEN_EYES_X2) CAT_REPEAT4(CAT_ROW_CHEEKS_X2)
+    CAT_REPEAT4(CAT_ROW_NOSE_X2) CAT_REPEAT4(CAT_ROW_MOUTH_CLOSED_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2) CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2) CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+};
+
+static const uint8_t s_cat_rec_voice_map[] __attribute__((aligned(4))) = {
+    CAT_I4_PALETTE
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_EAR_TIP_X2)
+    CAT_REPEAT4(CAT_ROW_EAR_UPPER_X2) CAT_REPEAT4(CAT_ROW_EAR_BASE_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_TOP_X2) CAT_REPEAT4(CAT_ROW_FACE_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_X2) CAT_REPEAT4(CAT_ROW_OPEN_EYES_X2)
+    CAT_REPEAT4(CAT_ROW_OPEN_EYES_X2) CAT_REPEAT4(CAT_ROW_CHEEKS_X2)
+    CAT_REPEAT4(CAT_ROW_NOSE_X2) CAT_REPEAT4(CAT_ROW_MOUTH_CLOSED_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2) CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2)
+    CAT_REPEAT4(CAT_ROW_PAW_X2) CAT_REPEAT4(CAT_ROW_PAW_PAD_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+};
+
+static const uint8_t s_cat_play_voice_map[] __attribute__((aligned(4))) = {
+    CAT_I4_PALETTE
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_EAR_TIP_X2)
+    CAT_REPEAT4(CAT_ROW_EAR_UPPER_X2) CAT_REPEAT4(CAT_ROW_EAR_BASE_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_TOP_X2) CAT_REPEAT4(CAT_ROW_FACE_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_X2) CAT_REPEAT4(CAT_ROW_OPEN_EYES_X2)
+    CAT_REPEAT4(CAT_ROW_OPEN_EYES_X2) CAT_REPEAT4(CAT_ROW_CHEEKS_X2)
+    CAT_REPEAT4(CAT_ROW_NOSE_X2) CAT_REPEAT4(CAT_ROW_MOUTH_OPEN_X2)
+    CAT_REPEAT4(CAT_ROW_MOUTH_OPEN_X2) CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2) CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+};
+
+static const uint8_t s_cat_error_voice_map[] __attribute__((aligned(4))) = {
+    CAT_I4_PALETTE
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_EAR_TIP_X2)
+    CAT_REPEAT4(CAT_ROW_EAR_UPPER_X2) CAT_REPEAT4(CAT_ROW_EAR_BASE_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_TOP_X2) CAT_REPEAT4(CAT_ROW_FACE_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_X2) CAT_REPEAT4(CAT_ROW_ERROR_EYES_A_X2)
+    CAT_REPEAT4(CAT_ROW_ERROR_EYES_B_X2) CAT_REPEAT4(CAT_ROW_CHEEKS_X2)
+    CAT_REPEAT4(CAT_ROW_NOSE_X2) CAT_REPEAT4(CAT_ROW_MOUTH_CLOSED_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2) CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2)
+    CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2) CAT_REPEAT4(CAT_ROW_FACE_LOWER_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+    CAT_REPEAT4(CAT_ROW_CLEAR_X2) CAT_REPEAT4(CAT_ROW_CLEAR_X2)
+};
+
 _Static_assert(sizeof(s_cat_listen_map) == LCD_CAT_IMAGE_DATA_BYTES, "listen frame size");
 _Static_assert(sizeof(s_cat_open_map) == LCD_CAT_IMAGE_DATA_BYTES, "open frame size");
 _Static_assert(sizeof(s_cat_rec_map) == LCD_CAT_IMAGE_DATA_BYTES, "recording frame size");
 _Static_assert(sizeof(s_cat_play_map) == LCD_CAT_IMAGE_DATA_BYTES, "play frame size");
 _Static_assert(sizeof(s_cat_error_map) == LCD_CAT_IMAGE_DATA_BYTES, "error frame size");
+_Static_assert(sizeof(s_cat_listen_voice_map) == LCD_CAT_VOICE_IMAGE_DATA_BYTES, "voice listen frame size");
+_Static_assert(sizeof(s_cat_open_voice_map) == LCD_CAT_VOICE_IMAGE_DATA_BYTES, "voice open frame size");
+_Static_assert(sizeof(s_cat_rec_voice_map) == LCD_CAT_VOICE_IMAGE_DATA_BYTES, "voice recording frame size");
+_Static_assert(sizeof(s_cat_play_voice_map) == LCD_CAT_VOICE_IMAGE_DATA_BYTES, "voice play frame size");
+_Static_assert(sizeof(s_cat_error_voice_map) == LCD_CAT_VOICE_IMAGE_DATA_BYTES, "voice error frame size");
 
 #define CAT_IMAGE_DSC(map) \
     { \
@@ -295,6 +412,27 @@ static const lv_image_dsc_t s_cat_open = CAT_IMAGE_DSC(s_cat_open_map);
 static const lv_image_dsc_t s_cat_rec = CAT_IMAGE_DSC(s_cat_rec_map);
 static const lv_image_dsc_t s_cat_play = CAT_IMAGE_DSC(s_cat_play_map);
 static const lv_image_dsc_t s_cat_error = CAT_IMAGE_DSC(s_cat_error_map);
+
+#define CAT_VOICE_IMAGE_DSC(map) \
+    { \
+        .header = { \
+            .magic = LV_IMAGE_HEADER_MAGIC, \
+            .cf = LV_COLOR_FORMAT_I4, \
+            .flags = 0, \
+            .w = LCD_CAT_VOICE_IMAGE_WIDTH, \
+            .h = LCD_CAT_VOICE_IMAGE_HEIGHT, \
+            .stride = LCD_CAT_VOICE_IMAGE_STRIDE, \
+        }, \
+        .data_size = sizeof(map), \
+        .data = map, \
+        .reserved = NULL, \
+    }
+
+static const lv_image_dsc_t s_cat_listen_voice = CAT_VOICE_IMAGE_DSC(s_cat_listen_voice_map);
+static const lv_image_dsc_t s_cat_open_voice = CAT_VOICE_IMAGE_DSC(s_cat_open_voice_map);
+static const lv_image_dsc_t s_cat_rec_voice = CAT_VOICE_IMAGE_DSC(s_cat_rec_voice_map);
+static const lv_image_dsc_t s_cat_play_voice = CAT_VOICE_IMAGE_DSC(s_cat_play_voice_map);
+static const lv_image_dsc_t s_cat_error_voice = CAT_VOICE_IMAGE_DSC(s_cat_error_voice_map);
 
 static void lcd_cat_disable_after_allocation_failure(void)
 {
@@ -454,11 +592,11 @@ static void lcd_cat_update_for_voice_state(lcd_dashboard_voice_state_t state,
         lv_timer_resume(s_cat_animation_timer);
         ESP_LOGI(TAG, "LCD_CAT_AUDIO_SYNC start");
     } else {
+        ESP_LOGI(TAG, "LCD_CAT_AUDIO_STOP timestamp=%lld", esp_timer_get_time());
         lv_timer_pause(s_cat_animation_timer);
-        if (s_cat_voice_state == LCD_DASHBOARD_VOICE_PLAY) {
-            s_cat_play_mouth_open = false;
-            lcd_cat_set_frame(&s_cat_open, 0, 0);
-        }
+        s_cat_play_mouth_open = false;
+        lcd_cat_set_frame(&s_cat_open, 0, 0);
+        ESP_LOGI(TAG, "LCD_CAT_CLOSED timestamp=%lld", esp_timer_get_time());
         ESP_LOGI(TAG, "LCD_CAT_AUDIO_SYNC stop");
     }
 }
@@ -505,26 +643,28 @@ static void lcd_voice_ui_set_frame(const lv_image_dsc_t *frame, int16_t offset_x
         lv_image_set_src(s_voice_cat_image, frame);
         s_voice_cat_frame = frame;
     }
-    lv_obj_set_pos(s_voice_cat_image, LCD_VOICE_CAT_IMAGE_X + offset_x, LCD_VOICE_CAT_IMAGE_Y);
+    lv_obj_set_pos(s_voice_cat_image,
+                   LCD_VOICE_CAT_IMAGE_X + (offset_x * LCD_CAT_VOICE_SCALE),
+                   LCD_VOICE_CAT_IMAGE_Y);
 }
 
 static void lcd_voice_ui_apply_state(lcd_dashboard_voice_state_t state)
 {
     switch (state) {
     case LCD_DASHBOARD_VOICE_WAKE:
-        lcd_voice_ui_set_frame(&s_cat_listen, 0);
+        lcd_voice_ui_set_frame(&s_cat_listen_voice, 0);
         break;
     case LCD_DASHBOARD_VOICE_REC:
-        lcd_voice_ui_set_frame(&s_cat_rec, 0);
+        lcd_voice_ui_set_frame(&s_cat_rec_voice, 0);
         break;
     case LCD_DASHBOARD_VOICE_WAIT:
-        lcd_voice_ui_set_frame(&s_cat_open, 0);
+        lcd_voice_ui_set_frame(&s_cat_open_voice, 0);
         break;
     case LCD_DASHBOARD_VOICE_PLAY:
-        lcd_voice_ui_set_frame(&s_cat_open, 0);
+        lcd_voice_ui_set_frame(&s_cat_open_voice, 0);
         break;
     case LCD_DASHBOARD_VOICE_ERR:
-        lcd_voice_ui_set_frame(&s_cat_error, 0);
+        lcd_voice_ui_set_frame(&s_cat_error_voice, 0);
         break;
     case LCD_DASHBOARD_VOICE_LISTEN:
     default:
@@ -546,7 +686,7 @@ static bool lcd_voice_ui_create(lv_obj_t *screen)
         return false;
     }
     s_voice_cat_frame = NULL;
-    lcd_voice_ui_set_frame(&s_cat_listen, 0);
+    lcd_voice_ui_set_frame(&s_cat_listen_voice, 0);
     s_voice_animation_timer = lv_timer_create(lcd_voice_animation_timer_cb,
                                                LCD_CAT_ANIMATION_PERIOD_MS,
                                                NULL);
@@ -570,11 +710,12 @@ static void lcd_voice_animation_timer_cb(lv_timer_t *timer)
     if (s_voice_ui_state == LCD_DASHBOARD_VOICE_REC) {
         s_voice_animation_frame++;
         if (s_voice_animation_frame >= LCD_CAT_RECORDING_FRAMES) {
-            lcd_voice_ui_set_frame(&s_cat_rec, 0);
+            lcd_voice_ui_set_frame(&s_cat_rec_voice, 0);
             lv_timer_pause(timer);
             return;
         }
-        lcd_voice_ui_set_frame(&s_cat_rec, (s_voice_animation_frame & 1U) != 0U ? 1 : 0);
+        lcd_voice_ui_set_frame(&s_cat_rec_voice,
+                               (s_voice_animation_frame & 1U) != 0U ? 1 : 0);
         return;
     }
     if (s_voice_speaker_active) {
@@ -582,7 +723,9 @@ static void lcd_voice_animation_timer_cb(lv_timer_t *timer)
         if (s_voice_play_frame >= LCD_CAT_PLAY_MOUTH_PERIOD_FRAMES) {
             s_voice_play_frame = 0;
             s_voice_play_mouth_open = !s_voice_play_mouth_open;
-            lcd_voice_ui_set_frame(s_voice_play_mouth_open ? &s_cat_play : &s_cat_open, 0);
+            lcd_voice_ui_set_frame(s_voice_play_mouth_open ? &s_cat_play_voice :
+                                                               &s_cat_open_voice,
+                                  0);
         }
         return;
     }
@@ -638,15 +781,15 @@ static void lcd_voice_ui_update(lcd_dashboard_voice_state_t state, bool speaker_
     s_voice_play_frame = 0;
     if (speaker_active) {
         s_voice_play_mouth_open = true;
-        lcd_voice_ui_set_frame(&s_cat_play, 0);
+        lcd_voice_ui_set_frame(&s_cat_play_voice, 0);
         lv_timer_resume(s_voice_animation_timer);
         ESP_LOGI(TAG, "LCD_CAT_AUDIO_SYNC start");
     } else {
+        ESP_LOGI(TAG, "LCD_CAT_AUDIO_STOP timestamp=%lld", esp_timer_get_time());
         lv_timer_pause(s_voice_animation_timer);
-        if (s_voice_ui_state == LCD_DASHBOARD_VOICE_PLAY) {
-            s_voice_play_mouth_open = false;
-            lcd_voice_ui_set_frame(&s_cat_open, 0);
-        }
+        s_voice_play_mouth_open = false;
+        lcd_voice_ui_set_frame(&s_cat_open_voice, 0);
+        ESP_LOGI(TAG, "LCD_CAT_CLOSED timestamp=%lld", esp_timer_get_time());
         ESP_LOGI(TAG, "LCD_CAT_AUDIO_SYNC stop");
     }
 }
