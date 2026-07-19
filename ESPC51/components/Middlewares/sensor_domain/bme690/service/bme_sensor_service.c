@@ -87,8 +87,11 @@ static void bme_sensor_service_publish_latest(const bme690_data_t *sensor_data,
         return;
     }
 
-    bme_sensor_air_state_t air_state = BME_SENSOR_AIR_STATE_DEGRADED;
-    if (sensor_data->gas_valid && sensor_data->heat_stable) {
+    /* A fresh heater cycle has no trustworthy gas value yet; publish it as
+     * local initialization rather than an air-quality degradation. */
+    const bool gas_valid = sensor_data->gas_valid && sensor_data->heat_stable;
+    bme_sensor_air_state_t air_state = BME_SENSOR_AIR_STATE_INIT;
+    if (gas_valid) {
         air_state = air_quality->baseline_ready ? BME_SENSOR_AIR_STATE_READY :
                                                  BME_SENSOR_AIR_STATE_CALIBRATING;
     }
@@ -98,7 +101,8 @@ static void bme_sensor_service_publish_latest(const bme690_data_t *sensor_data,
     s_bme_service.latest_snapshot.temperature_c = sensor_data->temperature_c;
     s_bme_service.latest_snapshot.humidity_percent = sensor_data->humidity_percent;
     s_bme_service.latest_snapshot.pressure_hpa = sensor_data->pressure_hpa;
-    s_bme_service.latest_snapshot.gas_resistance_ohm = sensor_data->gas_resistance_ohm;
+    s_bme_service.latest_snapshot.gas_resistance_ohm = gas_valid ? sensor_data->gas_resistance_ohm : 0U;
+    s_bme_service.latest_snapshot.gas_valid = gas_valid;
     s_bme_service.latest_snapshot.air_state = air_state;
     portEXIT_CRITICAL(&s_bme_service_lock);
 }

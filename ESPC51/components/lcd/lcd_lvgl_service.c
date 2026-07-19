@@ -1025,8 +1025,12 @@ static void lcd_lvgl_update_dashboard(const lcd_dashboard_snapshot_t *snapshot,
                        "TEMP   %.1f \xC2\xB0" "C", (double)snapshot->temperature_c);
         (void)snprintf(s_humidity_text, sizeof(s_humidity_text), "HUM    %.1f %%", (double)snapshot->humidity_percent);
         (void)snprintf(s_pressure_text, sizeof(s_pressure_text), "PRESS  %.1f hPa", (double)snapshot->pressure_hpa);
-        (void)snprintf(s_gas_text, sizeof(s_gas_text), "GAS    %.1f kOhm",
-                       (double)snapshot->gas_resistance_ohm / 1000.0);
+        if (snapshot->gas_valid) {
+            (void)snprintf(s_gas_text, sizeof(s_gas_text), "GAS    %.1f kOhm",
+                           (double)snapshot->gas_resistance_ohm / 1000.0);
+        } else {
+            (void)snprintf(s_gas_text, sizeof(s_gas_text), "GAS    --");
+        }
         (void)snprintf(s_air_text, sizeof(s_air_text), "AIR    %s",
                        lcd_dashboard_air_state_name(snapshot->air_state));
         air_color = lcd_dashboard_air_state_color(snapshot->air_state);

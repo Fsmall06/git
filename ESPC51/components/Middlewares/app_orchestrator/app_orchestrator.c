@@ -102,6 +102,7 @@ static bool app_lcd_dashboard_snapshot(lcd_dashboard_snapshot_t *out_snapshot, v
         .humidity_percent = bme.humidity_percent,
         .pressure_hpa = bme.pressure_hpa,
         .gas_resistance_ohm = bme.gas_resistance_ohm,
+        .gas_valid = bme.gas_valid,
         .air_state = app_lcd_air_state(bme.air_state),
         .csi_valid = csi.valid,
         .motion_score = csi.motion_score,

@@ -63,6 +63,7 @@ typedef struct {
     float humidity_percent;
     float pressure_hpa;
     uint32_t gas_resistance_ohm;
+    bool gas_valid;
     bme_sensor_air_state_t air_state;
 } bme_sensor_snapshot_t;
 
