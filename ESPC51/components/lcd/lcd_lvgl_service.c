@@ -4,6 +4,7 @@
 
 #include "lcd.h"
 #include "touch_cst816t.h"
+#include "boot_screen.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -14,6 +15,7 @@
 #include "lvgl.h"
 
 extern esp_err_t voice_chain_request_local_wake(void);
+extern void boot_screen_set_dashboard_refresh_timer(lv_timer_t *timer);
 
 #define LCD_LVGL_DRAW_BUFFER_LINES 1U
 #define LCD_LVGL_DRAW_BUFFER_PIXELS (LCD_H_RES * LCD_LVGL_DRAW_BUFFER_LINES)
@@ -82,6 +84,7 @@ static lv_obj_t *s_voice_root;
 static lv_obj_t *s_cat_image;
 static lv_obj_t *s_cat_hit_area;
 static lv_timer_t *s_cat_animation_timer;
+static lv_timer_t *s_dashboard_refresh_timer;
 static lv_obj_t *s_voice_cat_image;
 static lv_timer_t *s_voice_animation_timer;
 static char s_temp_text[32];
@@ -1229,9 +1232,10 @@ static esp_err_t lcd_lvgl_create_status_ui(void)
     lcd_lvgl_log_memory("after_first_refresh");
     lcd_lvgl_log_memory("after_first_voice_refresh");
 
-    if (lv_timer_create(lcd_lvgl_dashboard_timer_cb,
-                        LCD_DASHBOARD_SNAPSHOT_REFRESH_MS,
-                        NULL) == NULL) {
+    s_dashboard_refresh_timer = lv_timer_create(lcd_lvgl_dashboard_timer_cb,
+                                                LCD_DASHBOARD_SNAPSHOT_REFRESH_MS,
+                                                NULL);
+    if (s_dashboard_refresh_timer == NULL) {
         ESP_LOGE(TAG, "dashboard timer creation failed");
         lvgl_port_unlock();
         return ESP_ERR_NO_MEM;
@@ -1324,6 +1328,9 @@ esp_err_t lcd_service_start(void)
         (void)lvgl_port_deinit();
         return ret;
     }
+
+    boot_screen_set_dashboard_refresh_timer(s_dashboard_refresh_timer);
+    boot_screen_start();
 
     lcd_lvgl_log_heap("display_on_before");
     if (!lvgl_port_lock(1000)) {
