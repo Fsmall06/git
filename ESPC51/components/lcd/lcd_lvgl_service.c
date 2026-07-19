@@ -3,6 +3,7 @@
 #include "lcd_service.h"
 
 #include "lcd.h"
+#include "touch_cst816t.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -34,6 +35,7 @@ extern esp_err_t voice_chain_request_local_wake(void);
 #define LCD_DASHBOARD_CONNECTION_LABEL_X 98
 #define LCD_DASHBOARD_CONNECTION_LABEL_Y 253
 #define LCD_DASHBOARD_CONNECTION_LABEL_WIDTH 100
+#define LCD_TOUCH_MIRROR_Y_ENABLE 1
 #define LCD_CAT_ANIMATION_PERIOD_MS 100U
 #define LCD_CAT_WAKE_FRAMES 6U
 #define LCD_CAT_RECORDING_FRAMES 6U
@@ -52,12 +54,19 @@ extern esp_err_t voice_chain_request_local_wake(void);
                                         (LCD_CAT_VOICE_IMAGE_STRIDE * LCD_CAT_VOICE_IMAGE_HEIGHT))
 #define LCD_CAT_IMAGE_X (LCD_H_RES - LCD_DASHBOARD_MARGIN_X - LCD_CAT_IMAGE_WIDTH - 8)
 #define LCD_CAT_IMAGE_Y 180
+#define LCD_DASHBOARD_CAT_HIT_WIDTH 90U
+#define LCD_DASHBOARD_CAT_HIT_HEIGHT 70U
+#define LCD_DASHBOARD_CAT_HIT_X \
+    (LCD_CAT_IMAGE_X - ((LCD_DASHBOARD_CAT_HIT_WIDTH - LCD_CAT_IMAGE_WIDTH) / 2))
+#define LCD_DASHBOARD_CAT_HIT_Y \
+    (LCD_CAT_IMAGE_Y - ((LCD_DASHBOARD_CAT_HIT_HEIGHT - LCD_CAT_IMAGE_HEIGHT) / 2))
 #define LCD_VOICE_CAT_IMAGE_X ((LCD_H_RES - LCD_CAT_VOICE_IMAGE_WIDTH) / 2)
 #define LCD_VOICE_CAT_IMAGE_Y ((LCD_V_RES - LCD_CAT_VOICE_IMAGE_HEIGHT) / 2)
 
 static const char *TAG = "LCD_LVGL";
 static const char *MEM_TAG = "LVGL_MEM";
 static lv_display_t *s_display;
+static lv_indev_t *s_touch_indev;
 static bool s_started;
 static lv_obj_t *s_temp_label;
 static lv_obj_t *s_humidity_label;
@@ -71,6 +80,7 @@ static lv_obj_t *s_connection_status_dot;
 static lv_obj_t *s_dashboard_root;
 static lv_obj_t *s_voice_root;
 static lv_obj_t *s_cat_image;
+static lv_obj_t *s_cat_hit_area;
 static lv_timer_t *s_cat_animation_timer;
 static lv_obj_t *s_voice_cat_image;
 static lv_timer_t *s_voice_animation_timer;
@@ -102,10 +112,108 @@ static bool s_voice_play_mouth_open;
 static bool s_voice_speaker_active;
 static bool s_voice_ui_visible;
 static bool s_voice_ui_disabled;
+static bool s_touch_pressed;
 
 static void lcd_lvgl_log_memory(const char *stage);
 static void lcd_cat_animation_timer_cb(lv_timer_t *timer);
 static void lcd_voice_animation_timer_cb(lv_timer_t *timer);
+
+static bool lcd_lvgl_map_touch_point(uint16_t raw_x,
+                                     uint16_t raw_y,
+                                     int32_t *x,
+                                     int32_t *y)
+{
+    if (x == NULL || y == NULL) {
+        return false;
+    }
+
+    int32_t mapped_x = raw_x;
+    int32_t mapped_y = raw_y;
+
+#if LCD_SWAP_XY_ENABLE
+    const int32_t swap = mapped_x;
+    mapped_x = mapped_y;
+    mapped_y = swap;
+#endif
+#if LCD_MIRROR_X_ENABLE
+    mapped_x = LCD_H_RES - 1 - mapped_x;
+#endif
+#if LCD_TOUCH_MIRROR_Y_ENABLE
+    mapped_y = LCD_V_RES - 1 - mapped_y;
+#endif
+
+    if (mapped_x < 0 || mapped_x >= LCD_H_RES || mapped_y < 0 || mapped_y >= LCD_V_RES) {
+        return false;
+    }
+
+    *x = mapped_x;
+    *y = mapped_y;
+    return true;
+}
+
+static void lcd_lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    (void)indev;
+
+    uint16_t raw_x = 0;
+    uint16_t raw_y = 0;
+    bool pressed = false;
+    const esp_err_t ret = cst816t_read_point(&raw_x, &raw_y, &pressed);
+
+    if (ret == ESP_OK && pressed) {
+        int32_t x = 0;
+        int32_t y = 0;
+        if (lcd_lvgl_map_touch_point(raw_x, raw_y, &x, &y)) {
+            data->point.x = x;
+            data->point.y = y;
+            data->state = LV_INDEV_STATE_PRESSED;
+
+            if (!s_touch_pressed) {
+                ESP_LOGI(TAG,
+                         "LCD_TOUCH_MAP raw=(%d,%d) mapped=(%d,%d)",
+                         (int)raw_x,
+                         (int)raw_y,
+                         (int)x,
+                         (int)y);
+                ESP_LOGI(TAG, "LCD_TOUCH_CLICK x=%d y=%d", (int)x, (int)y);
+            }
+            s_touch_pressed = true;
+            return;
+        }
+    }
+
+    data->state = LV_INDEV_STATE_RELEASED;
+    s_touch_pressed = false;
+}
+
+static esp_err_t lcd_lvgl_register_touch_indev(void)
+{
+    if (s_touch_indev != NULL) {
+        return ESP_OK;
+    }
+    if (s_display == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!lvgl_port_lock(1000)) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    s_touch_indev = lv_indev_create();
+    if (s_touch_indev != NULL) {
+        lv_indev_set_type(s_touch_indev, LV_INDEV_TYPE_POINTER);
+        lv_indev_set_read_cb(s_touch_indev, lcd_lvgl_touch_read_cb);
+        lv_indev_set_display(s_touch_indev, s_display);
+    }
+
+    lvgl_port_unlock();
+
+    if (s_touch_indev == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "LCD touch pointer indev registered");
+    return ESP_OK;
+}
 
 static void lcd_dashboard_cat_click_cb(lv_event_t *event)
 {
@@ -522,6 +630,10 @@ static void lcd_cat_disable_after_allocation_failure(void)
         lv_obj_delete(s_cat_image);
         s_cat_image = NULL;
     }
+    if (s_cat_hit_area != NULL) {
+        lv_obj_delete(s_cat_hit_area);
+        s_cat_hit_area = NULL;
+    }
     s_cat_frame = NULL;
     s_cat_voice_state_valid = false;
     s_cat_disabled = true;
@@ -575,6 +687,21 @@ static bool lcd_cat_create(lv_obj_t *screen)
     lcd_cat_set_frame(&s_cat_listen, 0, 0);
     lv_obj_add_flag(s_cat_image, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_cat_image, lcd_dashboard_cat_click_cb, LV_EVENT_CLICKED, NULL);
+
+    s_cat_hit_area = lv_obj_create(screen);
+    if (s_cat_hit_area == NULL) {
+        lcd_cat_disable_after_allocation_failure();
+        return false;
+    }
+    lv_obj_remove_style_all(s_cat_hit_area);
+    lv_obj_set_size(s_cat_hit_area,
+                    LCD_DASHBOARD_CAT_HIT_WIDTH,
+                    LCD_DASHBOARD_CAT_HIT_HEIGHT);
+    lv_obj_set_pos(s_cat_hit_area, LCD_DASHBOARD_CAT_HIT_X, LCD_DASHBOARD_CAT_HIT_Y);
+    lv_obj_set_style_bg_opa(s_cat_hit_area, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_clear_flag(s_cat_hit_area, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_cat_hit_area, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_cat_hit_area, lcd_dashboard_cat_click_cb, LV_EVENT_CLICKED, NULL);
 
     s_cat_animation_timer = lv_timer_create(lcd_cat_animation_timer_cb,
                                              LCD_CAT_ANIMATION_PERIOD_MS,
@@ -1219,6 +1346,17 @@ esp_err_t lcd_service_start(void)
     s_started = true;
     ESP_LOGI(TAG, "started with %u-byte single DMA draw buffer",
              (unsigned int)(LCD_LVGL_DRAW_BUFFER_PIXELS * sizeof(uint16_t)));
+
+    ret = cst816t_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "LCD touch init failed: %s", esp_err_to_name(ret));
+    } else {
+        ret = lcd_lvgl_register_touch_indev();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "LCD touch indev registration failed: %s", esp_err_to_name(ret));
+        }
+    }
+
     return ESP_OK;
 }
 
