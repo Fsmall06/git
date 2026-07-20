@@ -16,6 +16,13 @@ static const char *TAG = "BOOT_SCREEN";
 #define BOOT_SCREEN_STATUS_TEXT_ENABLED 1
 #define BOOT_SCREEN_STATUS_DOTS_ENABLED 1
 #define BOOT_SCREEN_STATUS_PROGRESS_ENABLED 1
+#define BOOT_SCREEN_MIN_DURATION_MS 3000U
+#define BOOT_SCREEN_MAX_DURATION_MS 8000U
+#define BOOT_SCREEN_STAGE_CHECK_PERIOD_MS 100U
+
+/* Keep ui independent from the Middlewares component graph. This read-only
+ * service query only reads the BME initialization state. */
+extern bool bme_sensor_service_is_initialized(void);
 
 static lv_obj_t *boot_screen_root = NULL;
 static lv_obj_t *s_boot_dot;
@@ -24,6 +31,8 @@ static lv_obj_t *s_boot_model;
 static lv_obj_t *s_boot_cat;
 static lv_obj_t *s_boot_status;
 static lv_obj_t *s_boot_progress;
+static lv_obj_t *s_boot_sensor_label;
+static lv_obj_t *s_boot_sensor_dot;
 static lv_timer_t *s_boot_cleanup_timer;
 static lv_timer_t *s_boot_stage_timer;
 static lv_timer_t *s_boot_progress_timer;
@@ -31,6 +40,8 @@ static lv_timer_t *s_boot_cat_timer;
 static lv_timer_t *s_dashboard_refresh_timer;
 static uint8_t s_boot_progress_value;
 static bool s_boot_cat_at_rest;
+static bool s_boot_sensor_ready;
+static uint32_t s_boot_started_at_ms;
 
 /*
  * The boot UI is an overlay so the existing Dashboard and voice pages are
@@ -79,6 +90,9 @@ static void boot_screen_clear_object_refs(void)
     s_boot_cat = NULL;
     s_boot_status = NULL;
     s_boot_progress = NULL;
+    s_boot_sensor_label = NULL;
+    s_boot_sensor_dot = NULL;
+    s_boot_sensor_ready = false;
 }
 
 static void boot_screen_stop_animations(void)
@@ -156,20 +170,39 @@ static void boot_screen_finish_cb(lv_anim_t *anim)
 
 static void boot_screen_stage_timer_cb(lv_timer_t *timer)
 {
-    if (timer == s_boot_stage_timer) {
-        s_boot_stage_timer = NULL;
+    if (timer == NULL || timer != s_boot_stage_timer || boot_screen_root == NULL) {
+        return;
     }
-    boot_screen_finish_cb(NULL);
-    if (timer != NULL) {
+
+    const bool sensor_ready = bme_sensor_service_is_initialized();
+    if (sensor_ready != s_boot_sensor_ready) {
+        const lv_color_t color = sensor_ready ? lv_color_hex(0x79D2A6) : lv_color_hex(0xE5B84B);
+        s_boot_sensor_ready = sensor_ready;
+        if (s_boot_sensor_label != NULL) {
+            lv_label_set_text(s_boot_sensor_label, sensor_ready ? "Sensor READY" : "Sensor INIT");
+            lv_obj_set_style_text_color(s_boot_sensor_label, color, LV_PART_MAIN);
+        }
+        if (s_boot_sensor_dot != NULL) {
+            lv_obj_set_style_bg_color(s_boot_sensor_dot, color, LV_PART_MAIN);
+        }
+    }
+
+    const uint32_t elapsed_ms = lv_tick_elaps(s_boot_started_at_ms);
+    if ((elapsed_ms >= BOOT_SCREEN_MIN_DURATION_MS && sensor_ready) ||
+        elapsed_ms >= BOOT_SCREEN_MAX_DURATION_MS) {
+        s_boot_stage_timer = NULL;
+        boot_screen_finish_cb(NULL);
         lv_timer_delete(timer);
     }
 }
 
 static void boot_screen_schedule_finish_timer(void)
 {
-    s_boot_stage_timer = lv_timer_create(boot_screen_stage_timer_cb, 3000, NULL);
+    s_boot_stage_timer = lv_timer_create(boot_screen_stage_timer_cb,
+                                         BOOT_SCREEN_STAGE_CHECK_PERIOD_MS,
+                                         NULL);
     if (s_boot_stage_timer != NULL) {
-        lv_timer_set_repeat_count(s_boot_stage_timer, 1);
+        lv_timer_set_repeat_count(s_boot_stage_timer, -1);
         lv_timer_set_auto_delete(s_boot_stage_timer, false);
     }
 }
@@ -310,6 +343,7 @@ void boot_screen_start(void)
     lv_obj_set_size(boot_screen_root, 240, 284);
     lv_obj_set_style_bg_color(boot_screen_root, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(boot_screen_root, LV_OPA_COVER, LV_PART_MAIN);
+    s_boot_started_at_ms = lv_tick_get();
 
 #if BOOT_SCREEN_ROOT_ONLY_TEST
     /* Reuse the normal deferred cleanup path without creating a child object. */
@@ -356,18 +390,21 @@ void boot_screen_start(void)
     const lv_color_t text_color = lv_color_hex(0xDCE7EF);
     const lv_color_t ready_color = lv_color_hex(0x79D2A6);
     const lv_color_t init_color = lv_color_hex(0xE5B84B);
-    const char *status_text[] = {"Display", "Sensor", "Network", "Audio"};
+    const char *status_text[] = {"Display", "Sensor INIT", "Network", "Audio"};
     const int16_t status_y[] = {125, 150, 175, 200};
     for (size_t i = 0; i < 4; i++) {
         lv_obj_t *label = lv_label_create(boot_screen_root);
         if (label != NULL) {
             lv_label_set_text(label, status_text[i]);
             lv_obj_set_pos(label, 70, status_y[i]);
-            lv_obj_set_style_text_color(label, text_color, LV_PART_MAIN);
+            lv_obj_set_style_text_color(label, i == 1U ? init_color : text_color, LV_PART_MAIN);
+            if (i == 1U) {
+                s_boot_sensor_label = label;
+            }
         }
     }
     (void)create_boot_dot(boot_screen_root, 50, 125, ready_color);
-    (void)create_boot_dot(boot_screen_root, 50, 150, ready_color);
+    s_boot_sensor_dot = create_boot_dot(boot_screen_root, 50, 150, init_color);
     (void)create_boot_dot(boot_screen_root, 50, 175, init_color);
     (void)create_boot_dot(boot_screen_root, 50, 200, init_color);
 #if BOOT_SCREEN_CAT_ENABLED
@@ -497,6 +534,9 @@ void boot_screen_start(void)
 
     lv_obj_invalidate(boot_screen_root);
 #endif
-    ESP_LOGI(TAG, "boot screen started duration_ms=3000");
+    ESP_LOGI(TAG,
+             "boot screen started min_duration_ms=%u max_wait_ms=%u",
+             (unsigned int)BOOT_SCREEN_MIN_DURATION_MS,
+             (unsigned int)BOOT_SCREEN_MAX_DURATION_MS);
     lvgl_port_unlock();
 }

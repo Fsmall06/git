@@ -371,6 +371,13 @@ bool bme_sensor_service_is_running(void)
     return bme_sensor_service_snapshot(NULL, NULL, NULL, NULL);
 }
 
+bool bme_sensor_service_is_initialized(void)
+{
+    bool initialized = false;
+    (void)bme_sensor_service_snapshot(NULL, NULL, &initialized, NULL);
+    return initialized;
+}
+
 bool bme_sensor_service_is_paused(void)
 {
     bool paused = false;
@@ -387,4 +394,11 @@ void bme_sensor_service_get_latest_snapshot(bme_sensor_snapshot_t *out_snapshot)
     portENTER_CRITICAL(&s_bme_service_lock);
     *out_snapshot = s_bme_service.latest_snapshot;
     portEXIT_CRITICAL(&s_bme_service_lock);
+}
+
+bool bme_sensor_service_is_gas_ready(void)
+{
+    bme_sensor_snapshot_t snapshot = {0};
+    bme_sensor_service_get_latest_snapshot(&snapshot);
+    return snapshot.valid && snapshot.gas_valid;
 }

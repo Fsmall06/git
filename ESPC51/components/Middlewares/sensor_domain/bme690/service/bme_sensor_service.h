@@ -123,11 +123,17 @@ void bme_sensor_service_stop(void);
 /** @brief 查询服务任务是否已启动；诊断或状态页调用，返回 true/false。 */
 bool bme_sensor_service_is_running(void);
 
+/** Return true after BME690 hardware initialization completed successfully. */
+bool bme_sensor_service_is_initialized(void);
+
 /** @brief 查询当前是否处于暂停态；voice/runtime 诊断调用，返回 true/false。 */
 bool bme_sensor_service_is_paused(void);
 
 /** Copy the latest completed BME690 sample without performing I2C or HTTP work. */
 void bme_sensor_service_get_latest_snapshot(bme_sensor_snapshot_t *out_snapshot);
+
+/** Return true only after a completed sample has valid, heater-stable gas data. */
+bool bme_sensor_service_is_gas_ready(void);
 
 #ifdef __cplusplus
 }
