@@ -18,6 +18,8 @@ static const char *TAG = "BOOT_SCREEN";
 #define BOOT_SCREEN_STATUS_PROGRESS_ENABLED 1
 #define BOOT_SCREEN_MIN_DURATION_MS 3000U
 #define BOOT_SCREEN_MAX_DURATION_MS 8000U
+#define BOOT_SCREEN_PROGRESS_COMPLETE_HOLD_MS 500U
+#define BOOT_SCREEN_TIMEOUT_HOLD_MS 1000U
 #define BOOT_SCREEN_STAGE_CHECK_PERIOD_MS 100U
 
 /* Keep ui independent from the Middlewares component graph. This read-only
@@ -48,12 +50,17 @@ static lv_timer_t *s_boot_progress_timer;
 static lv_timer_t *s_boot_cat_timer;
 static lv_timer_t *s_dashboard_refresh_timer;
 static uint8_t s_boot_progress_value;
+static uint8_t s_boot_progress_target;
 static bool s_boot_cat_at_rest;
 static bool s_boot_display_ready;
 static bool s_boot_sensor_ready;
 static bool s_boot_network_ready;
 static bool s_boot_audio_ready;
+static bool s_boot_completion_pending;
+static bool s_boot_timeout_pending;
 static uint32_t s_boot_started_at_ms;
+static uint32_t s_boot_progress_full_at_ms;
+static uint32_t s_boot_timeout_shown_at_ms;
 
 /*
  * The boot UI is an overlay so the existing Dashboard and voice pages are
@@ -114,6 +121,12 @@ static void boot_screen_clear_object_refs(void)
     s_boot_sensor_ready = false;
     s_boot_network_ready = false;
     s_boot_audio_ready = false;
+    s_boot_completion_pending = false;
+    s_boot_timeout_pending = false;
+    s_boot_progress_value = 0U;
+    s_boot_progress_target = 0U;
+    s_boot_progress_full_at_ms = 0U;
+    s_boot_timeout_shown_at_ms = 0U;
 }
 
 static void boot_screen_stop_animations(void)
@@ -224,10 +237,60 @@ static void boot_screen_stage_timer_cb(lv_timer_t *timer)
     BOOT_SCREEN_UPDATE_STATUS(audio, "Audio");
 #undef BOOT_SCREEN_UPDATE_STATUS
 
+    const bool all_ready = display_ready && sensor_ready && network_ready && audio_ready;
+    if (all_ready) {
+        s_boot_completion_pending = true;
+        s_boot_progress_target = 100U;
+    } else if (!s_boot_completion_pending && !s_boot_timeout_pending) {
+        s_boot_progress_target = (display_ready ? 25U : 0U) +
+                                 (sensor_ready ? 25U : 0U) +
+                                 (network_ready ? 25U : 0U) +
+                                 (audio_ready ? 25U : 0U);
+    }
+
     const uint32_t elapsed_ms = lv_tick_elaps(s_boot_started_at_ms);
-    if ((elapsed_ms >= BOOT_SCREEN_MIN_DURATION_MS && display_ready && sensor_ready &&
-         network_ready && audio_ready) ||
-        elapsed_ms >= BOOT_SCREEN_MAX_DURATION_MS) {
+    if (elapsed_ms >= BOOT_SCREEN_MAX_DURATION_MS && !s_boot_completion_pending &&
+        !s_boot_timeout_pending) {
+        const lv_color_t timeout_color = lv_color_hex(0xE59A3A);
+        const lv_color_t skip_color = lv_color_hex(0x8A8F98);
+        s_boot_timeout_pending = true;
+        s_boot_timeout_shown_at_ms = lv_tick_get();
+        s_boot_progress_target = 100U;
+        if (!network_ready && s_boot_network_label != NULL) {
+            lv_label_set_text(s_boot_network_label, "Network TIMEOUT");
+            lv_obj_set_style_text_color(s_boot_network_label, timeout_color, LV_PART_MAIN);
+            if (s_boot_network_dot != NULL) {
+                lv_obj_set_style_bg_color(s_boot_network_dot, timeout_color, LV_PART_MAIN);
+            }
+        }
+        if (!audio_ready && s_boot_audio_label != NULL) {
+            lv_label_set_text(s_boot_audio_label, "Audio SKIP");
+            lv_obj_set_style_text_color(s_boot_audio_label, skip_color, LV_PART_MAIN);
+            if (s_boot_audio_dot != NULL) {
+                lv_obj_set_style_bg_color(s_boot_audio_dot, skip_color, LV_PART_MAIN);
+            }
+        }
+    }
+
+    bool progress_hold_complete = false;
+    if (s_boot_completion_pending && s_boot_progress_value >= 100U) {
+        if (s_boot_progress_full_at_ms == 0U) {
+            s_boot_progress_full_at_ms = lv_tick_get();
+        } else {
+            progress_hold_complete =
+                lv_tick_elaps(s_boot_progress_full_at_ms) >= BOOT_SCREEN_PROGRESS_COMPLETE_HOLD_MS;
+        }
+    }
+
+    bool timeout_hold_complete = false;
+    if (s_boot_timeout_pending &&
+        lv_tick_elaps(s_boot_timeout_shown_at_ms) >= BOOT_SCREEN_TIMEOUT_HOLD_MS) {
+        timeout_hold_complete = true;
+    }
+
+    if ((elapsed_ms >= BOOT_SCREEN_MIN_DURATION_MS && progress_hold_complete) ||
+        timeout_hold_complete ||
+        (elapsed_ms >= BOOT_SCREEN_MAX_DURATION_MS && s_boot_completion_pending)) {
         s_boot_stage_timer = NULL;
         boot_screen_finish_cb(NULL);
         lv_timer_delete(timer);
@@ -248,7 +311,22 @@ static void boot_screen_schedule_finish_timer(void)
 static void boot_screen_progress_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
-    s_boot_progress_value += 4U;
+    if (s_boot_progress == NULL) {
+        return;
+    }
+
+    if (s_boot_progress_value < s_boot_progress_target) {
+        s_boot_progress_value += 10U;
+        if (s_boot_progress_value > s_boot_progress_target) {
+            s_boot_progress_value = s_boot_progress_target;
+        }
+    } else if (s_boot_progress_value > s_boot_progress_target) {
+        s_boot_progress_value -= 10U;
+        if (s_boot_progress_value < s_boot_progress_target) {
+            s_boot_progress_value = s_boot_progress_target;
+        }
+    }
+
     lv_bar_set_value(s_boot_progress, s_boot_progress_value, LV_ANIM_OFF);
 }
 
@@ -259,10 +337,11 @@ static void boot_screen_start_progress_timer(void)
     }
 
     s_boot_progress_value = 0;
+    s_boot_progress_target = 0;
     lv_bar_set_value(s_boot_progress, s_boot_progress_value, LV_ANIM_OFF);
     s_boot_progress_timer = lv_timer_create(boot_screen_progress_timer_cb, 100, NULL);
     if (s_boot_progress_timer != NULL) {
-        lv_timer_set_repeat_count(s_boot_progress_timer, 25);
+        lv_timer_set_repeat_count(s_boot_progress_timer, -1);
         lv_timer_set_auto_delete(s_boot_progress_timer, false);
     }
 }
