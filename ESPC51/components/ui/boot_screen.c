@@ -23,6 +23,9 @@ static const char *TAG = "BOOT_SCREEN";
 /* Keep ui independent from the Middlewares component graph. This read-only
  * service query only reads the BME initialization state. */
 extern bool bme_sensor_service_is_initialized(void);
+extern bool lcd_service_is_started(void);
+extern bool wifi_is_connected(void);
+extern bool audio_player_is_initialized(void);
 
 static lv_obj_t *boot_screen_root = NULL;
 static lv_obj_t *s_boot_dot;
@@ -31,8 +34,14 @@ static lv_obj_t *s_boot_model;
 static lv_obj_t *s_boot_cat;
 static lv_obj_t *s_boot_status;
 static lv_obj_t *s_boot_progress;
+static lv_obj_t *s_boot_display_label;
 static lv_obj_t *s_boot_sensor_label;
+static lv_obj_t *s_boot_network_label;
+static lv_obj_t *s_boot_audio_label;
+static lv_obj_t *s_boot_display_dot;
 static lv_obj_t *s_boot_sensor_dot;
+static lv_obj_t *s_boot_network_dot;
+static lv_obj_t *s_boot_audio_dot;
 static lv_timer_t *s_boot_cleanup_timer;
 static lv_timer_t *s_boot_stage_timer;
 static lv_timer_t *s_boot_progress_timer;
@@ -40,7 +49,10 @@ static lv_timer_t *s_boot_cat_timer;
 static lv_timer_t *s_dashboard_refresh_timer;
 static uint8_t s_boot_progress_value;
 static bool s_boot_cat_at_rest;
+static bool s_boot_display_ready;
 static bool s_boot_sensor_ready;
+static bool s_boot_network_ready;
+static bool s_boot_audio_ready;
 static uint32_t s_boot_started_at_ms;
 
 /*
@@ -90,9 +102,18 @@ static void boot_screen_clear_object_refs(void)
     s_boot_cat = NULL;
     s_boot_status = NULL;
     s_boot_progress = NULL;
+    s_boot_display_label = NULL;
     s_boot_sensor_label = NULL;
+    s_boot_network_label = NULL;
+    s_boot_audio_label = NULL;
+    s_boot_display_dot = NULL;
     s_boot_sensor_dot = NULL;
+    s_boot_network_dot = NULL;
+    s_boot_audio_dot = NULL;
+    s_boot_display_ready = false;
     s_boot_sensor_ready = false;
+    s_boot_network_ready = false;
+    s_boot_audio_ready = false;
 }
 
 static void boot_screen_stop_animations(void)
@@ -174,21 +195,38 @@ static void boot_screen_stage_timer_cb(lv_timer_t *timer)
         return;
     }
 
+    const bool display_ready = lcd_service_is_started();
     const bool sensor_ready = bme_sensor_service_is_initialized();
-    if (sensor_ready != s_boot_sensor_ready) {
-        const lv_color_t color = sensor_ready ? lv_color_hex(0x79D2A6) : lv_color_hex(0xE5B84B);
-        s_boot_sensor_ready = sensor_ready;
-        if (s_boot_sensor_label != NULL) {
-            lv_label_set_text(s_boot_sensor_label, sensor_ready ? "Sensor READY" : "Sensor INIT");
-            lv_obj_set_style_text_color(s_boot_sensor_label, color, LV_PART_MAIN);
-        }
-        if (s_boot_sensor_dot != NULL) {
-            lv_obj_set_style_bg_color(s_boot_sensor_dot, color, LV_PART_MAIN);
-        }
-    }
+    const bool network_ready = wifi_is_connected();
+    const bool audio_ready = audio_player_is_initialized();
+    const lv_color_t ready_color = lv_color_hex(0x79D2A6);
+    const lv_color_t init_color = lv_color_hex(0xE5B84B);
+
+#define BOOT_SCREEN_UPDATE_STATUS(name, title) \
+    do { \
+        if (name##_ready != s_boot_##name##_ready) { \
+            const lv_color_t color = name##_ready ? ready_color : init_color; \
+            s_boot_##name##_ready = name##_ready; \
+            if (s_boot_##name##_label != NULL) { \
+                lv_label_set_text(s_boot_##name##_label, \
+                                  name##_ready ? title " READY" : title " INIT"); \
+                lv_obj_set_style_text_color(s_boot_##name##_label, color, LV_PART_MAIN); \
+            } \
+            if (s_boot_##name##_dot != NULL) { \
+                lv_obj_set_style_bg_color(s_boot_##name##_dot, color, LV_PART_MAIN); \
+            } \
+        } \
+    } while (0)
+
+    BOOT_SCREEN_UPDATE_STATUS(display, "Display");
+    BOOT_SCREEN_UPDATE_STATUS(sensor, "Sensor");
+    BOOT_SCREEN_UPDATE_STATUS(network, "Network");
+    BOOT_SCREEN_UPDATE_STATUS(audio, "Audio");
+#undef BOOT_SCREEN_UPDATE_STATUS
 
     const uint32_t elapsed_ms = lv_tick_elaps(s_boot_started_at_ms);
-    if ((elapsed_ms >= BOOT_SCREEN_MIN_DURATION_MS && sensor_ready) ||
+    if ((elapsed_ms >= BOOT_SCREEN_MIN_DURATION_MS && display_ready && sensor_ready &&
+         network_ready && audio_ready) ||
         elapsed_ms >= BOOT_SCREEN_MAX_DURATION_MS) {
         s_boot_stage_timer = NULL;
         boot_screen_finish_cb(NULL);
@@ -387,26 +425,30 @@ void boot_screen_start(void)
     lv_anim_set_completed_cb(&isolated_finish, boot_screen_finish_cb);
     lv_anim_start(&isolated_finish);
 #elif BOOT_SCREEN_STATUS_ONLY_TEST
-    const lv_color_t text_color = lv_color_hex(0xDCE7EF);
-    const lv_color_t ready_color = lv_color_hex(0x79D2A6);
     const lv_color_t init_color = lv_color_hex(0xE5B84B);
-    const char *status_text[] = {"Display", "Sensor INIT", "Network", "Audio"};
+    const char *status_text[] = {"Display INIT", "Sensor INIT", "Network INIT", "Audio INIT"};
     const int16_t status_y[] = {125, 150, 175, 200};
     for (size_t i = 0; i < 4; i++) {
         lv_obj_t *label = lv_label_create(boot_screen_root);
         if (label != NULL) {
             lv_label_set_text(label, status_text[i]);
             lv_obj_set_pos(label, 70, status_y[i]);
-            lv_obj_set_style_text_color(label, i == 1U ? init_color : text_color, LV_PART_MAIN);
-            if (i == 1U) {
+            lv_obj_set_style_text_color(label, init_color, LV_PART_MAIN);
+            if (i == 0U) {
+                s_boot_display_label = label;
+            } else if (i == 1U) {
                 s_boot_sensor_label = label;
+            } else if (i == 2U) {
+                s_boot_network_label = label;
+            } else {
+                s_boot_audio_label = label;
             }
         }
     }
-    (void)create_boot_dot(boot_screen_root, 50, 125, ready_color);
+    s_boot_display_dot = create_boot_dot(boot_screen_root, 50, 125, init_color);
     s_boot_sensor_dot = create_boot_dot(boot_screen_root, 50, 150, init_color);
-    (void)create_boot_dot(boot_screen_root, 50, 175, init_color);
-    (void)create_boot_dot(boot_screen_root, 50, 200, init_color);
+    s_boot_network_dot = create_boot_dot(boot_screen_root, 50, 175, init_color);
+    s_boot_audio_dot = create_boot_dot(boot_screen_root, 50, 200, init_color);
 #if BOOT_SCREEN_CAT_ENABLED
     s_boot_cat = lv_image_create(boot_screen_root);
     if (s_boot_cat != NULL) {

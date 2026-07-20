@@ -168,6 +168,9 @@ esp_err_t audio_player_stream_abort(void);
  */
 bool audio_player_is_speaker_active(void);
 
+/** Return true after the speaker player has initialized its IIS resources. */
+bool audio_player_is_initialized(void);
+
 /**
  * @brief Release the inactive speaker session after a bounded receiver/drain shutdown.
  *

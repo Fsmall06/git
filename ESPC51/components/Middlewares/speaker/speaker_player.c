@@ -1151,6 +1151,11 @@ bool audio_player_is_speaker_active(void)
     return __atomic_load_n(&s_speaker_active, __ATOMIC_ACQUIRE);
 }
 
+bool audio_player_is_initialized(void)
+{
+    return s_pcm_player_state != AUDIO_PLAYER_STATE_UNINITIALIZED;
+}
+
 esp_err_t audio_player_release_session(uint32_t timeout_ms)
 {
     if (speaker_player_called_from_isr()) {
